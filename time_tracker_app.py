@@ -271,7 +271,6 @@ class DatabaseManager:
             except sqlite3.Error as e: print(f"Error finding descendants for ID {current_id}: {e}")
         return descendants
 
-# В классе DatabaseManager:
     def add_time_entry(self, activity_id, duration_seconds, timestamp=None):
         """Добавляет запись времени. Можно указать конкретный timestamp (всегда сохраняет как UTC)."""
         if not self.conn or not activity_id or duration_seconds <= 0: return False
@@ -616,15 +615,25 @@ class DatabaseManager:
 # =============================================================
 
 class HeatmapWidget(QWidget):
-    """Displays a heatmap of habit completion for a year."""
+    """
+    Displays a heatmap of habit completion for a year.
+    Includes aligned weekday labels and day numbers within cells.
+    Day number font is black on gradient background, no outline.
+    """
+    def _calculate_minimum_size(self):
+        """Calculates the minimum required size based on cells and labels."""
+        # Ensure consistent rounding/casting to int for QSize
+        width = int(self.weekday_label_width + 53 * (self.cell_size + self.cell_spacing) + self.cell_spacing)
+        height = int(self.month_label_height + 7 * (self.cell_size + self.cell_spacing) + self.cell_spacing)
+        return QSize(width, height)
 
-    def __init__(self, db_manager: DatabaseManager, parent=None):
+    def __init__(self, db_manager: 'DatabaseManager', parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
         self.year = QDate.currentDate().year()
-        self.daily_done_counts = {} # {QDate: count}
-        self.max_done_count = 1
-        self.habit_configs = {}
+        self.daily_done_counts = defaultdict(int) # {QDate: count}
+        self.max_done_count = 1 # Not currently used for coloring, but kept
+        self.habit_configs = {} # {activity_id: (type, unit, goal)}
 
         # --- Heatmap Appearance ---
         self.cell_size = 16
@@ -632,115 +641,145 @@ class HeatmapWidget(QWidget):
         self.cell_radius = 3
         self.month_label_height = 20
         self.weekday_label_width = 30
-        self.heatmap_color = QColor(0, 100, 255) # Base color for intensity
+        # self.heatmap_color = QColor(0, 100, 255) # Base color (Overridden by gradient)
+        self.day_number_font_size = 7 # Font size for day number inside cell
 
         self.start_date = QDate(self.year, 1, 1)
         self.end_date = QDate(self.year, 12, 31)
 
         # --- Precalculated Layout Data ---
-        self._cell_rects = {} # {QDate: QRectF}
-        self._month_labels = [] # List of (QPointF, str)
-        self._weekday_labels = [] # List of (QPointF, str)
-        self._needs_layout_update = True # Flag to recalculate geometry
+        self._cell_rects = {} # {QDate: QRectF} Store calculated cell positions
+        self._month_labels = [] # List of (QPointF, str) for month label positions/text
+        self._weekday_labels = [] # List of (QPointF, str) for weekday label positions/text
+        self._needs_layout_update = True # Flag to recalculate geometry on resize/show
 
         # --- Animation Timer ---
         self.heatmap_animation_timer = QTimer(self)
-        self.heatmap_animation_timer.timeout.connect(self.update)
-        self.heatmap_animation_timer.start(100)
+        self.heatmap_animation_timer.timeout.connect(self.update) # Trigger repaint for animation
+        # Timer started in showEvent
 
         self.setMinimumSize(self._calculate_minimum_size())
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed) # Expands horizontally
         self.load_data() # Load data initially
+
+    # --- Simplified drawing function (NO OUTLINE) ---
     def drawOutlinedText(self, painter: QPainter, rect: QRectF, flags: int,
-                         text: str, text_color: QColor, outline_color: QColor,
-                         font: QFont = None):
+                         text: str, text_color: QColor, font: QFont = None):
+        """Draws text directly without any outline or shadow."""
         painter.save()
         if font:
-            painter.setFont(font) # Устанавливаем шрифт, если передан
+            painter.setFont(font)
 
-        offset = 1
-        painter.setPen(outline_color)
-        # Рисуем 4 раза со смещением для обводки
-        painter.drawText(rect.translated(offset, offset), flags, text)
-        painter.drawText(rect.translated(-offset, -offset), flags, text)
-        painter.drawText(rect.translated(-offset, offset), flags, text)
-        painter.drawText(rect.translated(offset, -offset), flags, text)
+        alignment = Qt.AlignmentFlag(flags) # Ensure it's the correct type
 
-        # Рисуем основной текст
+        # Set the pen to the desired text color
         painter.setPen(text_color)
-        painter.drawText(rect, flags, text)
+
+        # Draw the text directly using the provided rectangle and alignment
+        painter.drawText(rect, alignment, text)
+
         painter.restore()
-    # --- Конец вспомогательной функции ---
+    # --- End drawing function ---
+
+# Внутри класса HeatmapWidget:
 
     # --- Layout Calculation ---
     def _calculate_layout(self):
         """Calculates positions for cells and labels based on current widget size."""
+        print("Recalculating heatmap layout...") # Добавим отладочный вывод
         self._cell_rects = {}
         self._month_labels = []
-        self._weekday_labels = []
+        self._weekday_labels = [] # Очищаем список перед заполнением
 
         widget_rect = self.rect()
-        fm = QFontMetrics(self.font()) # Use self.font()
+        base_font = self.font()
 
-        # --- Calculate Month Labels ---
-        month_font = self.font(); month_font.setBold(True)
+        # --- Calculate Month Labels (No changes needed here) ---
+        month_font = QFont(base_font); month_font.setBold(True)
         fm_month = QFontMetrics(month_font)
         current_month = -1
         first_day_of_year = QDate(self.year, 1, 1)
         for week in range(53):
-            x_pos = self.weekday_label_width + week * (self.cell_size + self.cell_spacing) + self.cell_spacing
-            date_in_week = self.start_date.addDays(week * 7)
-            month_of_week = date_in_week.month()
-            if month_of_week != current_month:
-                month_text = QLocale().monthName(month_of_week, QLocale.FormatType.ShortFormat)
-                text_width = fm_month.horizontalAdvance(month_text)
-                # Check if label fits horizontally before adding
-                if x_pos + text_width < widget_rect.width() - self.cell_spacing:
-                    # Use QPointF for potential fractional positions
-                    label_pos = QPointF(x_pos, fm_month.ascent() + 2.0)
-                    self._month_labels.append((label_pos, month_text))
-                current_month = month_of_week
+            x_pos_start_of_week = self.weekday_label_width + week * (self.cell_size + self.cell_spacing) + self.cell_spacing
+            first_day_of_year_weekday = first_day_of_year.dayOfWeek()
+            days_offset = week * 7 - (first_day_of_year_weekday - 1)
+            date_in_week = first_day_of_year.addDays(days_offset)
 
-        # --- Calculate Weekday Labels ---
-        weekdays = ["", "M", "", "W", "", "F", ""]
-        start_y_week = self.month_label_height + self.cell_spacing
-        for i in range(7):
-             y = start_y_week + i * (self.cell_size + self.cell_spacing) \
-                 + self.cell_size / 2.0 + fm.height() / 2.0 - 2.0 # Center vertically
-             label = weekdays[i]
-             if label:
-                 label_pos = QPointF(float(self.cell_spacing), y)
-                 self._weekday_labels.append((label_pos, label))
+            if date_in_week.year() == self.year:
+                month_of_week = date_in_week.month()
+                if month_of_week != current_month:
+                    month_text = QLocale().monthName(month_of_week, QLocale.FormatType.ShortFormat)
+                    text_width = fm_month.horizontalAdvance(month_text)
+                    if x_pos_start_of_week + text_width < widget_rect.width() - self.cell_spacing:
+                        label_pos = QPointF(x_pos_start_of_week, fm_month.ascent() + 2.0)
+                        self._month_labels.append((label_pos, month_text))
+                    current_month = month_of_week
 
-        # --- Calculate Day Cell Rects ---
+        # --- Calculate Weekday Labels (Show ALL 7 days using QLocale) ---
+        start_y_week = float(self.month_label_height + self.cell_spacing)
+        fm_weekday = QFontMetrics(base_font)
+        text_height = fm_weekday.height()
+        locale = QLocale() # Get default locale for day names
+        print(f"Using locale: {locale.language()}, {locale.country()}") # Отладка локали
+
+        for i in range(7): # Наш индекс цикла i = 0..6 соответствует строкам Пн..Вс
+            qt_day_of_week = i + 1 # Конвертируем индекс 0..6 в номер дня Qt 1..7
+            # Получаем стандартное короткое имя (например, "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс" для русского)
+            label_text = locale.dayName(qt_day_of_week, QLocale.FormatType.ShortFormat)
+
+            # --- Опционально: Использовать одну букву, если "Пн", "Вт" и т.д. слишком широкие ---
+            # Раскомментируйте одну из строк ниже, если стандартные короткие имена не помещаются
+            # label_text = locale.dayName(qt_day_of_week, QLocale.FormatType.NarrowFormat) # Может дать "П", "В", "С" и т.д. (зависит от локали)
+            # Или определить вручную (не зависит от локали):
+            # single_letter_days = ["ᛗ", "ᛏ", "ᛟ", "ᚦ", "ᚠ", "ᛚ", "ᛋ"] # Пн -> Вс
+            # label_text = single_letter_days[i]
+            # --- Конец опциональной части ---
+
+            # Рассчитываем вертикальный центр строки i-ой ячейки
+            cell_center_y = start_y_week + i * (self.cell_size + self.cell_spacing) + self.cell_size / 2.0
+            # Позиционируем базовую линию текста так, чтобы он выглядел выровненным по вертикали
+            y_pos = cell_center_y + fm_weekday.ascent() / 2.0 - fm_weekday.descent() / 1.5 # Тонкая настройка смещения
+
+            # Рассчитываем горизонтальную позицию - выравниваем по левому краю
+            x_pos = float(self.cell_spacing)
+
+            label_pos = QPointF(x_pos, y_pos)
+            # Добавляем информацию о метке для КАЖДОГО дня в список (убрана проверка на пустую строку)
+            self._weekday_labels.append((label_pos, label_text))
+        # --- End Weekday Label Calculation ---
+
+        # --- ОТЛАДКА: Выведем содержимое списка меток дней недели ---
+        print(f"Calculated weekday labels: {self._weekday_labels}")
+        # --- КОНЕЦ ОТЛАДКИ ---
+
+        # --- Calculate Day Cell Rects (No changes needed here) ---
         start_x = float(self.weekday_label_width + self.cell_spacing)
         start_y = float(self.month_label_height + self.cell_spacing)
         current_date = self.start_date
         while current_date <= self.end_date:
-            day_of_week = current_date.dayOfWeek()
-            day_of_year = current_date.dayOfYear()
+            day_of_week_index = current_date.dayOfWeek() - 1 # 0 to 6
             first_day_weekday = self.start_date.dayOfWeek()
-            col = (day_of_year + first_day_weekday - 2) // 7
-            row = day_of_week - 1
+            col = (current_date.dayOfYear() + first_day_weekday - 2) // 7
+            row = day_of_week_index
+
             x = start_x + col * (self.cell_size + self.cell_spacing)
             y = start_y + row * (self.cell_size + self.cell_spacing)
             self._cell_rects[current_date] = QRectF(x, y, float(self.cell_size), float(self.cell_size))
             current_date = current_date.addDays(1)
 
         self._needs_layout_update = False
-        print("Heatmap layout recalculated.")
-
+        print("Heatmap layout recalculation finished.")
     def resizeEvent(self, event):
         """Mark layout as needing update on resize."""
         self._needs_layout_update = True
         super().resizeEvent(event)
         self.update() # Trigger repaint after resize
 
-    # --- Data Handling (Same as before) ---
+    # --- Data Handling ---
     def _calculate_minimum_size(self):
          width = self.weekday_label_width + 53 * (self.cell_size + self.cell_spacing) + self.cell_spacing
          height = self.month_label_height + 7 * (self.cell_size + self.cell_spacing) + self.cell_spacing
-         return QSize(int(width), int(height)) # QSize needs int
+         return QSize(int(width), int(height))
 
     def minimumSizeHint(self) -> QSize: return self._calculate_minimum_size()
     def sizeHint(self) -> QSize: return self._calculate_minimum_size()
@@ -751,41 +790,68 @@ class HeatmapWidget(QWidget):
         self.update()
 
     def load_data(self):
+        """Loads habit configurations and logs for the current year."""
         print(f"HeatmapWidget: Loading data for year {self.year}...")
         habits_raw = self.db_manager.get_all_habits()
-        self.habit_configs = {h[0]: (h[2], h[3], h[4]) for h in habits_raw}
+        self.habit_configs = {h[0]: (h[2], h[3], h[4]) for h in habits_raw} # id -> (type, unit, goal)
         if not self.habit_configs:
-             print("HeatmapWidget: No habits configured."); self.daily_done_counts={}; self.max_done_count=1; return
+             print("HeatmapWidget: No habits configured.")
+             self.daily_done_counts={}
+             self.max_done_count=1
+             self._needs_layout_update = True # Need layout even if empty
+             return
+
+        # Fetch all logs for the entire year for efficiency
         logs = self.db_manager.get_habit_logs_for_date_range(
-            self.start_date.toString("yyyy-MM-dd"), self.end_date.toString("yyyy-MM-dd"))
+             self.start_date.toString("yyyy-MM-dd"), self.end_date.toString("yyyy-MM-dd"))
+
         self._calculate_daily_done_counts(logs)
-        print(f"HeatmapWidget: Data loaded. Max done count = {self.max_done_count}")
-        self._needs_layout_update = True # Recalculate layout when data loads too
+        print(f"HeatmapWidget: Data loaded. Calculated done counts for {len(self.daily_done_counts)} days.")
+        self._needs_layout_update = True # Recalculate layout after data load
 
     def _is_habit_done(self, activity_id, value):
-         if value is None: return False
-         if activity_id not in self.habit_configs: return False
-         habit_type, _, habit_goal = self.habit_configs[activity_id]
-         if habit_type == HABIT_TYPE_BINARY: return value == 1.0
-         elif habit_type == HABIT_TYPE_PERCENTAGE: return value >= 100.0
-         elif habit_type == HABIT_TYPE_NUMERIC: return habit_goal is not None and habit_goal > 0 and value >= habit_goal
-         else: return False
+        """Checks if a specific habit is considered 'done' based on its type, goal, and logged value."""
+        if value is None: return False
+        if activity_id not in self.habit_configs: return False
+        habit_type, _, habit_goal = self.habit_configs[activity_id]
+
+        if habit_type == HABIT_TYPE_BINARY: return value == 1.0
+        elif habit_type == HABIT_TYPE_PERCENTAGE: return value >= 100.0
+        elif habit_type == HABIT_TYPE_NUMERIC:
+            # Done if a positive goal exists and the value meets or exceeds it
+            return habit_goal is not None and habit_goal > 0 and value >= habit_goal
+        else: return False # Unknown type or not a habit
 
     def _calculate_daily_done_counts(self, logs):
-         self.daily_done_counts = defaultdict(int); temp_max_done = 0
-         current_date = self.start_date; today = QDate.currentDate()
-         while current_date <= self.end_date:
-             date_str = current_date.toString("yyyy-MM-dd"); done_count_for_day = 0
-             for habit_id in self.habit_configs.keys():
-                 if self._is_habit_done(habit_id, logs.get((habit_id, date_str))): done_count_for_day += 1
-             if done_count_for_day > 0:
-                  self.daily_done_counts[current_date] = done_count_for_day
-                  if current_date <= today: temp_max_done = max(temp_max_done, done_count_for_day)
-             current_date = current_date.addDays(1)
-         self.max_done_count = max(1, temp_max_done)
+        """Calculates how many habits were 'done' for each day of the year."""
+        self.daily_done_counts = defaultdict(int)
+        temp_max_done = 0
+        current_date = self.start_date
+        today = QDate.currentDate()
 
+        while current_date <= self.end_date:
+            date_str = current_date.toString("yyyy-MM-dd")
+            done_count_for_day = 0
+            for habit_id in self.habit_configs.keys():
+                 log_value = logs.get((habit_id, date_str)) # Get log for this habit/date
+                 if self._is_habit_done(habit_id, log_value):
+                     done_count_for_day += 1
+
+            # Store count only if > 0 to keep dict smaller, or store 0s too?
+            # Storing only > 0 is fine as .get(date, 0) handles missing keys later.
+            if done_count_for_day > 0:
+                 self.daily_done_counts[current_date] = done_count_for_day
+                 # Track max done count only for past/present days for gradient scaling (optional)
+                 if current_date <= today:
+                     temp_max_done = max(temp_max_done, done_count_for_day)
+
+            current_date = current_date.addDays(1)
+        # self.max_done_count = max(1, temp_max_done) # Not used currently, but available
+
+
+    # --- Main Painting Logic ---
     def paintEvent(self, event):
-        """Draw the heatmap with thresholded color and count text."""
+        """Draw the heatmap with animated gradient and day numbers."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -793,33 +859,33 @@ class HeatmapWidget(QWidget):
             self._calculate_layout()
 
         today = QDate.currentDate()
-        fm = QFontMetrics(self.font())
+        palette = self.palette() # Get current theme palette
 
-        outline_future_color = Qt.GlobalColor.white
-        outline_past_color = Qt.GlobalColor.lightGray
-        base_past_color = Qt.GlobalColor.white
-        month_label_color = self.palette().color(QPalette.ColorRole.Text)
-        weekday_label_color = self.palette().color(QPalette.ColorRole.Text)
+        # --- Define Colors (adapt better to theme) ---
+        outline_future_color = palette.color(QPalette.ColorGroup.Normal, QPalette.ColorRole.Window).lighter(115)
+        outline_past_color = palette.color(QPalette.ColorGroup.Normal, QPalette.ColorRole.Mid) # Slightly darker outline
+        base_past_color = palette.color(QPalette.ColorGroup.Normal, QPalette.ColorRole.Base) # Background for 0 done days
+        month_label_color = palette.color(QPalette.ColorRole.Text)
+        weekday_label_color = palette.color(QPalette.ColorRole.Text)
+        # Color for text when background is the plain base_past_color
+        text_color_not_done = palette.color(QPalette.ColorGroup.Normal, QPalette.ColorRole.WindowText) # Should contrast with Base
 
-        # --- Шрифты и цвета для счетчика ---
-        count_font = QFont(self.font())
-        count_font.setPointSize(7) # Маленький шрифт
-        count_text_color = QColor(30, 30, 30, 200) # Полупрозрачный темный
-        count_outline_color = QColor(255, 255, 255, 100) # Очень бледная обводка
-
-        # --- Рисуем метки месяцев и дней недели (без изменений) ---
+        # --- Draw Month Labels ---
         painter.setPen(month_label_color)
-        month_font = self.font(); month_font.setBold(True); painter.setFont(month_font)
+        month_font = QFont(self.font()); month_font.setBold(True); painter.setFont(month_font)
         for pos, text in self._month_labels:
              painter.drawText(pos, text)
-        painter.setFont(self.font()) # Restore
+        painter.setFont(self.font()) # Restore default font
 
+        # --- Draw Weekday Labels ---
         painter.setPen(weekday_label_color)
         for pos, text in self._weekday_labels:
              painter.drawText(pos, text)
-        # --------------------------------------------------------
 
+        # --- Draw Day Cells ---
         current_time = time.time()
+        day_font = QFont(self.font())
+        day_font.setPointSize(self.day_number_font_size)
 
         for date, cell_rect in self._cell_rects.items():
             if not cell_rect: continue
@@ -827,177 +893,84 @@ class HeatmapWidget(QWidget):
             path = QPainterPath()
             path.addRoundedRect(cell_rect, self.cell_radius, self.cell_radius)
 
-            done_count = 0 # Инициализируем счетчик для этой ячейки
-
+            # --- Drawing Logic based on Date ---
             if date > today:
-                # Будущее: только обводка
+                # Future date: Faint outline only for the cell
                 painter.setPen(QPen(outline_future_color, 0.5))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawPath(path)
             else:
-                # Прошлое или сегодня: Заливка + Счетчик
-                done_count = self.daily_done_counts.get(date, 0)
-                painter.setPen(QPen(outline_past_color, 0.5))
+                # Past or today: Fill based on done_count + Draw Day Number
+                done_count = self.daily_done_counts.get(date, 0) # Default to 0 if no entry
+                painter.setPen(QPen(outline_past_color, 0.5)) # Cell outline for past days
 
+                # --- Determine Background and Text Color ---
                 if done_count == 0:
-                    # 0 выполнено: белый фон
+                    # Not Done: Use theme's default text color for this background
+                    day_number_text_color = text_color_not_done
+
+                    # Draw background for 0 done
                     painter.setBrush(base_past_color)
                     painter.drawPath(path)
                 else:
-                    # > 0 выполнено: Градиент с порогом 70%
-
-                    total_habits = len(self.habit_configs)
-                    percentage_done = min(done_count / total_habits, 1.0) if total_habits > 0 else 0.0
-
-                    # --- Новая логика цвета с порогом 70% ---
-                    threshold = 0.70
-                    saturation = 0
-                    lightness = 0
-
-                    # Бледный цвет для < 70%
-                    pale_saturation = 5
-                    pale_lightness = 250
-
-                    if percentage_done <= threshold:
-                        saturation = pale_saturation
-                        lightness = pale_lightness
-                    else:
-                        # Яркий цвет для > 70%
-                        bright_min_saturation = pale_saturation # Начинаем с бледного
-                        bright_max_saturation = 255 # Доходим до максимума
-                        bright_min_lightness = 200 # Доходим до более темного/яркого
-                        bright_max_lightness = pale_lightness # Начинаем с бледного
-
-                        # Прогресс внутри яркого диапазона (0.0 -> 1.0)
-                        bright_progress = (percentage_done - threshold) / (1.0 - threshold)
-
-                        saturation = bright_min_saturation + int(bright_progress * (bright_max_saturation - bright_min_saturation))
-                        lightness = bright_max_lightness - int(bright_progress * (bright_max_lightness - bright_min_lightness))
-
-                        # Ограничиваем значения на всякий случай
-                        saturation = max(0, min(255, saturation))
-                        lightness = max(0, min(255, lightness))
-                    # --- Конец новой логики цвета ---
-
-                    hue1 = int(current_time * 150) % 360
-                    hue2 = (hue1 + 60) % 360 # Увеличим разницу hue для контраста
-
-                    color1 = QColor.fromHsl(hue1, saturation, lightness)
-                    color2 = QColor.fromHsl(hue2, max(80, saturation - 15), min(245, lightness + 10)) # Небольшие вариации для градиента
-
-                    gradient = QLinearGradient(cell_rect.topLeft(), cell_rect.bottomRight())
-                    gradient.setColorAt(0, color1); gradient.setColorAt(1, color2)
-
-                    painter.setBrush(QBrush(gradient))
-                    painter.drawPath(path) # Рисуем фон/градиент
-
-                # --- НОВОЕ: Рисуем счетчик поверх фона/градиента ---
-                if done_count > 0:
-                    # Рисуем текст счетчика с обводкой
-                    # Немного смещаем прямоугольник текста внутрь от краев ячейки
-                    text_rect = cell_rect.adjusted(1, 1, -2, -1)
-                    self.drawOutlinedText(painter, text_rect,
-                                          int(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight), # Явно приводим к int
-                                          str(done_count),
-                                          count_text_color, count_outline_color,
-                                          count_font) # Передаем шрифт
-                # --- КОНЕЦ РИСОВАНИЯ СЧЕТЧИКА ---
-    # --- Painting (Uses precalculated layout and new color logic) ---
-    def paintEvent(self, event):
-        """Draw the heatmap with animated gradient for completed days."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Recalculate layout if needed (e.g., after resize or data load)
-        if self._needs_layout_update or not self._cell_rects:
-            self._calculate_layout() # Вычисляем геометрию если нужно
-
-        today = QDate.currentDate()
-        fm = QFontMetrics(self.font())
-
-        # Colors from widget's palette
-        outline_future_color = Qt.GlobalColor.white
-        outline_past_color = Qt.GlobalColor.lightGray
-        base_past_color = Qt.GlobalColor.white # White for 0 done
-        month_label_color = self.palette().color(QPalette.ColorRole.Text)
-        weekday_label_color = self.palette().color(QPalette.ColorRole.Text)
-
-        # --- Draw Month Labels (from precalculated) ---
-        painter.setPen(month_label_color)
-        month_font = self.font(); month_font.setBold(True); painter.setFont(month_font)
-        for pos, text in self._month_labels:
-             painter.drawText(pos, text)
-        painter.setFont(self.font()) # Restore default font
-
-        # --- Draw Weekday Labels (from precalculated) ---
-        painter.setPen(weekday_label_color)
-        for pos, text in self._weekday_labels:
-             painter.drawText(pos, text)
-
-        # --- Draw Day Cells (using precalculated rects) ---
-        current_time = time.time() # Get time once per paint event
-
-        # Iterate through precalculated cell rectangles
-        for date, cell_rect in self._cell_rects.items():
-            if not cell_rect: continue # Skip if rect somehow missing
-
-            # Create rounded rect path for this cell
-            path = QPainterPath()
-            path.addRoundedRect(cell_rect, self.cell_radius, self.cell_radius)
-
-            # --- Drawing Logic based on Date ---
-            if date > today:
-                # Future date: White outline only
-                painter.setPen(QPen(outline_future_color, 0.5))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawPath(path)
-            else:
-                # Past or today: Fill based on done_count
-                done_count = self.daily_done_counts.get(date, 0)
-                painter.setPen(QPen(outline_past_color, 0.5)) # Set outline pen for past days
-
-                if done_count == 0:
-                    # 0 habits done: White base fill, gray outline
-                    painter.setBrush(base_past_color)
-                    painter.drawPath(path) # Draws outline + fill
-                else:
-                    # > 0 habits done: Animated gradient fill based on PERCENTAGE done
-                    total_habits = len(self.habit_configs)
-                    percentage_done = min(done_count / total_habits, 1.0) if total_habits > 0 else 0.0
+                    # Done (Gradient Background): Force text color to BLACK
+                    day_number_text_color = Qt.GlobalColor.black # <<< FORCED BLACK FONT
 
                     # --- Gradient Calculation ---
+                    total_habits = len(self.habit_configs) if self.habit_configs else 1
+                    percentage_done = min(done_count / total_habits, 1.0) if total_habits > 0 else 0.0
                     hue1 = int(current_time * 150) % 360
-                    hue2 = (hue1 + 40) % 360 # Simplified hue2 calculation
-
-                    # Saturation/Lightness depend on percentage_done
-                    saturation = 80 + int(percentage_done * 160) # Range 80-240
-                    lightness = 225 - int(percentage_done * 40)  # Range 225-185
-
+                    hue2 = (hue1 + 40) % 360
+                    # Adjust saturation/lightness based on percentage
+                    # Lower base saturation/lightness might look better with black text
+                    base_saturation = 80
+                    base_lightness = 210 # Make base lighter
+                    saturation = base_saturation + int(percentage_done * 150) # e.g., 80 -> 230
+                    lightness = base_lightness - int(percentage_done * 50)  # e.g., 210 -> 160
+                    saturation = max(0, min(255, saturation))
+                    lightness = max(0, min(255, lightness))
                     color1 = QColor.fromHsl(hue1, saturation, lightness)
-                    color2 = QColor.fromHsl(hue2, saturation, lightness) # Use same S/L
-
+                    color2 = QColor.fromHsl(hue2, saturation, lightness)
                     gradient = QLinearGradient(cell_rect.topLeft(), cell_rect.bottomRight())
                     gradient.setColorAt(0, color1); gradient.setColorAt(1, color2)
                     # --- End Gradient Calculation ---
 
-                    painter.setBrush(QBrush(gradient)) # Set gradient brush
-                    painter.drawPath(path) # Draws outline (set above) + gradient fill
-    # --- Timer Management ---
+                    # Draw gradient background
+                    painter.setBrush(QBrush(gradient))
+                    painter.drawPath(path)
+
+                # --- Draw Day Number (NO OUTLINE) ---
+                day_number = date.day()
+                # Call the simplified draw function (only requires text color)
+                self.drawOutlinedText(painter, cell_rect,
+                                      int(Qt.AlignmentFlag.AlignCenter), # Center alignment
+                                      str(day_number),
+                                      day_number_text_color, # Use the determined color
+                                      day_font)
+                # --- End Draw Day Number ---
+
+    # --- Timer Management for Animation ---
     def hideEvent(self, event):
+         """Stop animation timer when widget is hidden."""
          print("HeatmapWidget hidden, stopping animation timer.")
          self.heatmap_animation_timer.stop()
          super().hideEvent(event)
 
     def showEvent(self, event):
+         """Start animation timer when widget is shown."""
          print("HeatmapWidget shown, starting animation timer.")
+         # Ensure layout is calculated *before* starting updates if needed
+         if self._needs_layout_update or not self._cell_rects:
+             self._calculate_layout()
+         # Start timer only if it wasn't already active (prevents multiple starts)
          if not self.heatmap_animation_timer.isActive():
-              self.heatmap_animation_timer.start(100)
-         # Recalculate layout when shown, in case size changed while hidden
+             self.heatmap_animation_timer.start(100) # Update interval for animation
+         # Flag layout update in case size changed while hidden
          self._needs_layout_update = True
          super().showEvent(event)
-# --- End of HeatmapWidget ---
 
 # --- Timer Window (unchanged) ---
+
 class TimerWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
