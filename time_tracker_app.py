@@ -1,4 +1,5 @@
 import sys
+import uuid
 import sqlite3
 import time
 import os
@@ -93,62 +94,69 @@ class DatabaseManager:
     def _create_tables(self):
         if not self.conn: return
         try:
-            # Activities table - Add habit_goal
+            # Activities table (без изменений)
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS activities (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
                     parent_id INTEGER DEFAULT NULL,
-                    habit_type INTEGER DEFAULT NULL, -- NULL/0: Not habit, 1: Binary, 2: Percentage, 3: Numeric
-                    habit_unit TEXT DEFAULT NULL, -- Unit for Numeric type (e.g., 'pages', 'km', 'minutes')
+                    habit_type INTEGER DEFAULT NULL,
+                    habit_unit TEXT DEFAULT NULL,
                     habit_sort_order INTEGER,
-                    habit_goal REAL DEFAULT NULL, -- <<< NEW COLUMN for daily goal (numeric habits)
+                    habit_goal REAL DEFAULT NULL,
                     FOREIGN KEY (parent_id) REFERENCES activities (id) ON DELETE SET NULL
                 )
             ''')
-            # Add columns if they don't exist (for existing databases)
             self._add_column_if_not_exists('activities', 'habit_type', 'INTEGER DEFAULT NULL')
             self._add_column_if_not_exists('activities', 'habit_unit', 'TEXT DEFAULT NULL')
             self._add_column_if_not_exists('activities', 'habit_sort_order', 'INTEGER')
-            self._add_column_if_not_exists('activities', 'habit_goal', 'REAL DEFAULT NULL') # <<< ADD CHECK
+            self._add_column_if_not_exists('activities', 'habit_goal', 'REAL DEFAULT NULL')
 
-            # Time Entries Table
+            # Time Entries Table - <<< ИЗМЕНЕНИЯ ЗДЕСЬ >>>
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS time_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     activity_id INTEGER NOT NULL,
                     duration_seconds INTEGER NOT NULL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    entry_type TEXT DEFAULT 'work' NOT NULL CHECK(entry_type IN ('work', 'break')), -- НОВОЕ ПОЛЕ
+                    session_id REAL, -- НОВОЕ ПОЛЕ (ID сессии, можно хранить float time.time())
                     FOREIGN KEY (activity_id) REFERENCES activities (id) ON DELETE CASCADE
                 )
             ''')
+            # Добавляем новые колонки, если их нет
+            self._add_column_if_not_exists('time_entries', 'entry_type', "TEXT DEFAULT 'work' NOT NULL CHECK(entry_type IN ('work', 'break'))")
+            self._add_column_if_not_exists('time_entries', 'session_id', 'REAL')
+            # <<< КОНЕЦ ИЗМЕНЕНИЙ >>>
 
-            # Habit Logs Table
+            # Habit Logs Table (без изменений)
             self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS habit_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     activity_id INTEGER NOT NULL,
-                    log_date TEXT NOT NULL, -- Store as 'YYYY-MM-DD' string
-                    value REAL, -- Flexible: 1.0 for Binary Done, 0/25/50/75/100 for Percentage, numeric value otherwise. NULL = no entry.
+                    log_date TEXT NOT NULL,
+                    value REAL,
                     UNIQUE(activity_id, log_date),
                     FOREIGN KEY (activity_id) REFERENCES activities (id) ON DELETE CASCADE
                 )
             ''')
 
-            # Indexes
+            # Indexes (Добавлен индекс для session_id)
             self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_parent_id ON activities (parent_id);')
             self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_habit_type ON activities (habit_type);')
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_habit_sort_order ON activities (habit_sort_order);') # NEW INDEX
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_habit_sort_order ON activities (habit_sort_order);')
             self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_activity_id_timestamp ON time_entries (activity_id, timestamp);')
             self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_date ON time_entries (timestamp);')
             self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_habit_logs_date_activity ON habit_logs (log_date, activity_id);')
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_time_entries_session_id ON time_entries (session_id);') # Новый индекс
 
             self.conn.commit()
-            print("Tables checked/created/updated.")
+            print("Tables checked/created/updated (with entry_type, session_id).")
             self._initialize_habit_order()
 
         except sqlite3.Error as e:
             print(f"Error creating/updating tables: {e}")
+            if self.conn: self.conn.rollback()
 
     def _initialize_habit_order(self):
         """Sets initial sort order for habits that don't have one yet."""
@@ -271,55 +279,72 @@ class DatabaseManager:
             except sqlite3.Error as e: print(f"Error finding descendants for ID {current_id}: {e}")
         return descendants
 
-    def add_time_entry(self, activity_id, duration_seconds, timestamp=None):
-        """Добавляет запись времени. Можно указать конкретный timestamp (всегда сохраняет как UTC)."""
-        if not self.conn or not activity_id or duration_seconds <= 0: return False
+    def add_time_entry(self, activity_id, duration_seconds, timestamp=None, entry_type='work', session_id=None):
+        """
+        Добавляет запись времени (работы или перерыва).
+        Можно указать timestamp (локальный QDateTime), тип записи и ID сессии.
+        """
+        if not self.conn or activity_id is None or duration_seconds < 0:
+            if duration_seconds < 0: print("Warning: Attempted to add negative duration entry.")
+            return False
         duration_seconds = int(duration_seconds)
+        if entry_type not in ('work', 'break'):
+            print(f"Warning: Invalid entry_type '{entry_type}'. Defaulting to 'work'.")
+            entry_type = 'work'
+
         try:
             ts_str_for_db = None
+            # Обработка timestamp (если передан)
             if timestamp:
-                # timestamp здесь - это локальный QDateTime из QDateTimeEdit
                 if not isinstance(timestamp, QDateTime):
-                     # Попытка преобразовать, если это не QDateTime (маловероятно)
-                     try:
-                         timestamp = QDateTime.fromString(str(timestamp), "yyyy-MM-dd HH:mm:ss")
-                     except Exception:
-                         print("Предупреждение: Не удалось распознать переданный timestamp, используется CURRENT_TIMESTAMP.")
-                         timestamp = None # Сбрасываем, чтобы использовать CURRENT_TIMESTAMP
-
+                    try: timestamp = QDateTime.fromString(str(timestamp), "yyyy-MM-dd HH:mm:ss")
+                    except Exception: timestamp = None
                 if timestamp and timestamp.isValid():
-                    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Конвертируем локальное время в UTC ---
                     utc_dt = timestamp.toUTC()
-                    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-                    ts_str_for_db = utc_dt.toString("yyyy-MM-dd HH:mm:ss") # Форматируем UTC время для БД
+                    ts_str_for_db = utc_dt.toString("yyyy-MM-dd HH:mm:ss")
 
-            if ts_str_for_db: # Если был передан корректный timestamp
-                self.cursor.execute(
-                    "INSERT INTO time_entries (activity_id, duration_seconds, timestamp) VALUES (?, ?, ?)",
-                    (activity_id, duration_seconds, ts_str_for_db) # Вставляем строку UTC
-                )
-                ts_info = f"с timestamp (UTC) {ts_str_for_db}"
-            else: # Если timestamp не был передан или был некорректным
-                # Используем DEFAULT CURRENT_TIMESTAMP базы данных (который обычно UTC)
-                self.cursor.execute(
-                    "INSERT INTO time_entries (activity_id, duration_seconds) VALUES (?, ?)",
-                    (activity_id, duration_seconds)
-                )
-                ts_info = "с текущим timestamp (UTC по умолчанию)"
+            # Собираем SQL и параметры
+            # Используем CURRENT_TIMESTAMP базы данных, если timestamp не передан
+            sql = """
+                INSERT INTO time_entries (activity_id, duration_seconds, entry_type, session_id, timestamp)
+                VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            """
+            # Если ts_str_for_db есть, он подставится вместо COALESCE(?, ...)
+            # Если ts_str_for_db is None, COALESCE(NULL, CURRENT_TIMESTAMP) вернет CURRENT_TIMESTAMP
+            params = (activity_id, duration_seconds, entry_type, session_id, ts_str_for_db)
 
+            self.cursor.execute(sql, params)
             self.conn.commit()
-            print(f"Запись времени ({duration_seconds} сек) добавлена для activity_id {activity_id} {ts_info}.")
+
+            ts_info = f"с timestamp (UTC) {ts_str_for_db}" if ts_str_for_db else "с текущим timestamp (UTC)"
+            print(f"Запись времени ({entry_type}, {duration_seconds} сек, sess:{session_id}) добавлена для activity_id {activity_id} {ts_info}.")
             return True
         except sqlite3.Error as e:
-            print(f"Ошибка добавления записи времени: {e}")
-            # Полезно добавить откат транзакции в случае ошибки
+            print(f"Ошибка добавления записи времени ({entry_type}): {e}")
             if self.conn:
-                try:
-                    self.conn.rollback()
-                except sqlite3.Error as rb_err:
-                    print(f"Ошибка при откате транзакции: {rb_err}")
+                try: self.conn.rollback()
+                except sqlite3.Error as rb_err: print(f"Ошибка при откате транзакции: {rb_err}")
             return False
-        
+
+    def get_entries_for_date_with_type(self, date_str):
+        """Gets all time entries for a date, including entry type."""
+        if not self.conn or not date_str: return []
+        try:
+            # Добавляем te.entry_type в SELECT
+            self.cursor.execute("""
+                SELECT a.id, a.name, te.duration_seconds, te.entry_type,
+                       strftime('%Y-%m-%d %H:%M:%S', te.timestamp) as timestamp_str,
+                       te.session_id -- Также получаем ID сессии
+                FROM time_entries te JOIN activities a ON te.activity_id = a.id
+                WHERE DATE(te.timestamp) = ?
+                ORDER BY te.timestamp ASC, a.name ASC
+            """, (date_str,))
+            # Возвращает кортежи (id, name, duration, type, timestamp_str, session_id)
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            print(f"Error retrieving entries with type for date {date_str}: {e}")
+            return []
+
     def get_durations(self, activity_id):
         """Gets durations only for *this* specific activity."""
         if not self.conn or not activity_id: return []
@@ -404,19 +429,6 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"Error deleting time entry: {e}")
             return False
-
-    def get_entries_for_date(self, date_str):
-        """Gets all time entries for the specified date (YYYY-MM-DD)."""
-        if not self.conn or not date_str: return []
-        try:
-            self.cursor.execute("""
-                SELECT a.id, a.name, te.duration_seconds, strftime('%Y-%m-%d %H:%M:%S', te.timestamp) as timestamp_str
-                FROM time_entries te JOIN activities a ON te.activity_id = a.id
-                WHERE DATE(te.timestamp) = ? ORDER BY te.timestamp ASC """, (date_str,))
-            return self.cursor.fetchall()
-        except sqlite3.Error as e:
-            print(f"Error retrieving entries for date {date_str}: {e}")
-            return []
 
     def update_activity_name(self, activity_id, new_name, parent_id):
         """Updates the name of an activity."""
@@ -969,14 +981,24 @@ class HeatmapWidget(QWidget):
          self._needs_layout_update = True
          super().showEvent(event)
 
-# --- Timer Window (unchanged) ---
-
 class TimerWindow(QWidget):
-    def __init__(self, parent=None):
+    # Сигналы для MainWindow
+    pause_requested = pyqtSignal()
+    resume_requested = pyqtSignal()
+    end_requested = pyqtSignal()
+
+    # Состояния окна (для управления UI)
+    STATE_TRACKING = 0
+    STATE_PAUSED = 1
+
+    def __init__(self, initial_color=QColor(0, 0, 0, 180), parent=None):
         super().__init__(parent)
+        self._activity_name = "Activity" # Будет установлено позже
+        self._background_color = initial_color
+        self._display_color = initial_color
+        self.state = self.STATE_TRACKING # Начальное состояние
         self.is_overrun = False
         self.overrun_seconds = 0
-        self.background_color = QColor(0, 0, 0, 180)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -986,50 +1008,143 @@ class TimerWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        self.label = QLabel("00:00:00", self)
-        font = QFont()
-        font.setPointSize(16)
-        font.setBold(True)
-        self.label.setFont(font)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setStyleSheet("QLabel { color : white; background-color: transparent; padding: 5px; }")
-
+        # --- Layout ---
         layout = QVBoxLayout(self)
-        layout.addWidget(self.label)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(3)
+
+        # --- Верхняя метка (для Total Work/Total Pause) ---
+        self.info_label = QLabel("Total Work: 00:00:00", self) # Начальный текст
+        info_font = QFont()
+        info_font.setPointSize(8)
+        self.info_label.setFont(info_font)
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.info_label.setStyleSheet("QLabel { color : white; background-color: transparent; }")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        # --- Главная метка времени (для текущего интервала или статуса паузы) ---
+        self.time_label = QLabel("00:00:00", self)
+        time_font = QFont()
+        time_font.setPointSize(16)
+        time_font.setBold(True)
+        self.time_label.setFont(time_font)
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.time_label.setStyleSheet("QLabel { color : white; background-color: transparent; padding-bottom: 2px; }")
+        layout.addWidget(self.time_label)
+
+        # --- Кнопки ---
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(5)
+        self.pause_button = QPushButton("Pause")
+        self.resume_button = QPushButton("Resume")
+        self.end_button = QPushButton("End")
+
+        button_style = """
+            QPushButton {
+                background-color: rgba(85, 85, 85, 180); border: 1px solid #555;
+                color: white; padding: 2px 6px; border-radius: 3px; font-size: 9pt;
+                min-width: 50px;
+            }
+            QPushButton:hover { background-color: rgba(100, 100, 100, 200); }
+            QPushButton:pressed { background-color: rgba(120, 120, 120, 220); }
+        """
+        # ... (установка стиля и курсора для кнопок как в пред. версии) ...
+        self.pause_button.setStyleSheet(button_style)
+        self.resume_button.setStyleSheet(button_style)
+        self.end_button.setStyleSheet(button_style)
+        self.pause_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.end_button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Подключаем сигналы кнопок к сигналам окна
+        self.pause_button.clicked.connect(self.pause_requested.emit)
+        self.resume_button.clicked.connect(self.resume_requested.emit)
+        self.end_button.clicked.connect(self.end_requested.emit)
+
+        button_layout.addWidget(self.pause_button)
+        button_layout.addWidget(self.resume_button)
+        button_layout.addWidget(self.end_button)
+        layout.addLayout(button_layout)
+        # --- Конец кнопок ---
+
         self.setLayout(layout)
-        self.setFixedSize(170, 50) # Adjusted size slightly
+        self.setFixedSize(185, 95)
 
         self._mouse_press_pos = None
         self._mouse_move_pos = None
 
-    def set_overrun(self, overrun, seconds=0):
+        self._update_button_visibility() # Устанавливаем видимость кнопок по состоянию
+        self.update_background_color()
+        # Tooltip будет установлен из MainWindow при создании
+
+    def set_background_color(self, color: QColor):
+        self._background_color = color
+        self.update_background_color()
+
+    def _set_internal_state(self, new_state):
+        """Только изменяет внутреннее состояние и обновляет UI кнопок/фона."""
+        if self.state != new_state:
+            self.state = new_state
+            self._update_button_visibility()
+            self.update_background_color() # Обновляем фон при смене состояния
+
+    def _update_button_visibility(self):
+        """Показывает/скрывает кнопки Pause/Resume."""
+        is_tracking = (self.state == self.STATE_TRACKING)
+        self.pause_button.setVisible(is_tracking)
+        self.resume_button.setVisible(not is_tracking)
+
+    def showTrackingState(self, current_interval_str, total_work_str, activity_name):
+        """Обновляет окно для состояния TRACKING."""
+        if self.state != self.STATE_TRACKING:
+             self._set_internal_state(self.STATE_TRACKING)
+        self.info_label.setText(f"{activity_name}\nTotal Work: {total_work_str}")
+        self.time_label.setText(current_interval_str)
+        self.setToolTip(f"Tracking: {activity_name}\nTotal Work: {total_work_str}\nCurrent Interval: {current_interval_str}")
+
+
+    def showPausedState(self, current_break_str, total_break_str, activity_name):
+        """Обновляет окно для состояния PAUSED."""
+        if self.state != self.STATE_PAUSED:
+             self._set_internal_state(self.STATE_PAUSED)
+        self.info_label.setText(f"{activity_name}\nTotal Pause: {total_break_str}")
+        self.time_label.setText(f"Paused: {current_break_str}")
+        self.setToolTip(f"Paused: {activity_name}\nTotal Pause: {total_break_str}\nCurrent Break: {current_break_str}")
+
+
+    def set_overrun(self, overrun, seconds=0): # Для countdown
+        needs_update = (self.is_overrun != overrun) or (self.overrun_seconds != seconds)
         self.is_overrun = overrun
         self.overrun_seconds = seconds if overrun else 0
-        self.update_background_color()
-        self.update() # Trigger repaint
+        if needs_update:
+            self.update_background_color() # Только обновляем цвет, текст ставит MainWindow
 
     def update_background_color(self):
-        if not self.is_overrun:
-            self.background_color = QColor(0, 0, 0, 180)
-        else:
+        """Обновляет цвет фона."""
+        if self.is_overrun: # Приоритет у overrun для countdown
             red_factor = min(1.0, self.overrun_seconds / MAX_OVERRUN_SECONDS_FOR_RED)
-            red_component = int(red_factor * 150)
-            self.background_color = QColor(red_component, 0, 0, 190) # Slightly less transparent red
+            red_component = int(red_factor * 180)
+            self._display_color = QColor(red_component, 0, 0, 200)
+        elif self.state == self.STATE_PAUSED:
+            # Затемняем базовый цвет окна на паузе
+            self._display_color = self._background_color.darker(135) # Сделаем чуть темнее
+        else: # Стандартное состояние работы
+            self._display_color = self._background_color
+
+        self.update() # Запросить перерисовку
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QBrush(self.background_color))
+        painter.setBrush(QBrush(self._display_color))
         painter.setPen(QPen(Qt.PenStyle.NoPen))
         border_radius = 10.0
         rect = QRectF(self.rect())
-        rect.adjust(0.5, 0.5, -0.5, -0.5) # Adjust for pixel-perfect border
+        rect.adjust(0.5, 0.5, -0.5, -0.5)
         painter.drawRoundedRect(rect, border_radius, border_radius)
 
-    def setText(self, text):
-        self.label.setText(text)
-
+    # mousePressEvent, mouseMoveEvent, mouseReleaseEvent - без изменений
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._mouse_press_pos = event.globalPosition().toPoint()
@@ -1328,14 +1443,18 @@ class DailySnapshotDialog(QDialog):
         summary_layout = QVBoxLayout(summary_widget)
         summary_layout.setContentsMargins(0,0,0,0)
         summary_layout.addWidget(QLabel("Daily Activity Summary (including sub-activities):"))
-        self.summary_tree = QTreeWidget() # <--- Replaced QTableWidget with QTreeWidget
-        self.summary_tree.setColumnCount(2)
-        self.summary_tree.setHeaderLabels(["Activity", "Total Duration"])
+        self.summary_tree = QTreeWidget()
+        # --- ИЗМЕНЕНИЕ: Больше колонок ---
+        self.summary_tree.setColumnCount(4)
+        self.summary_tree.setHeaderLabels(["Activity", "Work Time", "Break Time", "Total Time"])
         header_summary = self.summary_tree.header()
-        header_summary.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header_summary.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header_summary.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Activity
+        header_summary.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # Work
+        header_summary.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Break
+        header_summary.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # Total
         self.summary_tree.setSortingEnabled(True)
-        self.summary_tree.sortByColumn(1, Qt.SortOrder.DescendingOrder) # Sort by time descending
+        self.summary_tree.sortByColumn(3, Qt.SortOrder.DescendingOrder) # Сортировка по общему времени
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         summary_layout.addWidget(self.summary_tree)
         splitter.addWidget(summary_widget)
 
@@ -1345,13 +1464,15 @@ class DailySnapshotDialog(QDialog):
         details_layout.setContentsMargins(0,0,0,0)
         details_layout.addWidget(QLabel("All Entries for the Day:"))
         self.entries_table = QTableWidget()
-        self.entries_table.setColumnCount(3)
-        self.entries_table.setHorizontalHeaderLabels(["Activity", "Duration", "Start/Entry Time"])
+        # --- ИЗМЕНЕНИЕ: Больше колонок ---
+        self.entries_table.setColumnCount(4)
+        self.entries_table.setHorizontalHeaderLabels(["Activity", "Duration", "Type", "Entry Time"])
         header_details = self.entries_table.horizontalHeader()
-        header_details.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header_details.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header_details.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.entries_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        header_details.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Activity
+        header_details.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # Duration
+        header_details.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Type
+        header_details.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # Time
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         self.entries_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.entries_table.setSortingEnabled(True)
         details_layout.addWidget(self.entries_table)
@@ -1374,141 +1495,146 @@ class DailySnapshotDialog(QDialog):
         self.load_snapshot() # Load on opening
 
     def load_snapshot(self):
-        """Loads, aggregates, and displays data for the selected date, considering hierarchy."""
+        """Loads, aggregates, and displays data including work/break times."""
         selected_date = self.date_edit.date().toString("yyyy-MM-dd")
         print(f"Loading snapshot for {selected_date}...")
 
-        # 1. Get all entries for this date (activity_id, activity_name, duration, timestamp_str)
-        entries = self.db_manager.get_entries_for_date(selected_date)
+        # --- ИЗМЕНЕНИЕ: Используем новый метод с типом ---
+        entries = self.db_manager.get_entries_for_date_with_type(selected_date)
+        # Теперь entries содержит: (activity_id, activity_name, duration, entry_type, timestamp_str)
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-        # 2. Clear widgets
+        # Очистка виджетов
         self.entries_table.setSortingEnabled(False)
         self.entries_table.setRowCount(0)
         self.summary_tree.clear()
         self.summary_tree.setSortingEnabled(False)
 
         total_duration_day_seconds = 0
+        total_work_day_seconds = 0 # Общее РАБОЧЕЕ время за день
         if not entries:
-            print(f"No entries for {selected_date}.")
-            self.summary_label.setText("Total time for the day: 00:00:00")
-            self.entries_table.setSortingEnabled(True)
-            self.summary_tree.setSortingEnabled(True)
+            # ... (код для случая без записей) ...
             return
 
-        # 3. Populate the detailed entries table and calculate total time
+        # --- ИЗМЕНЕНИЕ: Словари для агрегации по типам ---
+        work_time_by_activity_id = defaultdict(int)
+        break_time_by_activity_id = defaultdict(int)
+        activity_names = {} # Сохраним имена активностей {id: name}
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         self.entries_table.setRowCount(len(entries))
-        # Dictionary to store *direct* time spent per activity ID
-        direct_time_by_activity_id = defaultdict(int)
+        # --- ИЗМЕНЕНИЕ: Обработка entry_type ---
+# <<< ИСПРАВЛЕНИЕ: Добавлена переменная _session_id для распаковки 6-го элемента >>>
+        for row, (activity_id, activity_name, duration, entry_type, timestamp_str, _session_id) in enumerate(entries):
+            total_duration_day_seconds += duration # Общее время (включая перерывы)
+            activity_names[activity_id] = activity_name # Сохраняем имя
 
-        direct_time_by_activity_id = defaultdict(int)
+            # Агрегация по типам
+            if entry_type == 'work':
+                work_time_by_activity_id[activity_id] += duration
+                total_work_day_seconds += duration # Считаем общее рабочее время
+            elif entry_type == 'break':
+                break_time_by_activity_id[activity_id] += duration
 
-        # Заполнение таблицы деталей и агрегация времени
-        for row, (activity_id, activity_name, duration, timestamp_str) in enumerate(entries): # timestamp_str из БД (UTC)
-            total_duration_day_seconds += duration
-            direct_time_by_activity_id[activity_id] += duration
-
-            # --- Заполнение таблицы детальных записей ---
+            # --- Заполнение таблицы детальных записей (Добавляем Type) ---
             formatted_duration = MainWindow.format_time(None, duration)
-            formatted_timestamp_display = timestamp_str # Значение по умолчанию
-
-            if timestamp_str:
-                 try:
-                    # 1. Парсим строку времени из БД
-                    dt_utc = QDateTime.fromString(timestamp_str, "yyyy-MM-dd HH:mm:ss")
-                    # 2. Указываем, что это время UTC
-                    dt_utc.setTimeSpec(Qt.TimeSpec.UTC)
-                    # 3. Конвертируем UTC время в локальное время пользователя
-                    dt_local = dt_utc.toLocalTime()
-                    # 4. Форматируем локальное время для отображения (здесь достаточно времени)
-                    formatted_timestamp_display = dt_local.toString("HH:mm:ss")
-                 except Exception as e:
-                    print(f"Ошибка парсинга/конвертации времени '{timestamp_str}' в слепке дня: {e}")
-                    # Оставляем исходную строку или только время из нее
-                    parts = timestamp_str.split(' ')
-                    if len(parts) > 1:
-                        formatted_timestamp_display = parts[1]
-
+            formatted_timestamp_display = timestamp_str # Default
+            try:
+                dt_utc = QDateTime.fromString(timestamp_str, "yyyy-MM-dd HH:mm:ss")
+                dt_utc.setTimeSpec(Qt.TimeSpec.UTC)
+                dt_local = dt_utc.toLocalTime()
+                formatted_timestamp_display = dt_local.toString("HH:mm:ss")
+            except Exception as e:
+                parts = timestamp_str.split(' '); formatted_timestamp_display = parts[1] if len(parts)>1 else timestamp_str
 
             name_item = QTableWidgetItem(activity_name)
             duration_item = QTableWidgetItem(formatted_duration)
-            # Используем конвертированное локальное время для отображения
+            type_item = QTableWidgetItem(entry_type.capitalize()) # Отображаем тип
             time_item = QTableWidgetItem(formatted_timestamp_display)
+
             duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter) # Выравниваем тип
             time_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            duration_item.setData(Qt.ItemDataRole.UserRole, duration) # Для сортировки
+            duration_item.setData(Qt.ItemDataRole.UserRole, duration)
 
             self.entries_table.setItem(row, 0, name_item)
             self.entries_table.setItem(row, 1, duration_item)
-            self.entries_table.setItem(row, 2, time_item)
+            self.entries_table.setItem(row, 2, type_item) # Новая колонка
+            self.entries_table.setItem(row, 3, time_item) # Старая колонка времени теперь 3я
+        # --- КОНЕЦ ИЗМЕНЕНИЯ в цикле ---
 
         self.entries_table.setSortingEnabled(True)
+        self.entries_table.sortByColumn(3, Qt.SortOrder.AscendingOrder) # Сортируем по времени записи
 
-        # 4. Get the full activity hierarchy (no need for habit info here)
-        activity_hierarchy = self.db_manager.get_activity_hierarchy() # Fetches habit info now, but not used here
-        # Dictionary to store ID -> hierarchy node for quick access
-        activity_nodes_map = {}
-        # Dictionary to store aggregated time (including descendants) per ID
-        aggregated_time_by_activity_id = defaultdict(int)
+        # --- ИЗМЕНЕНИЕ: Построение дерева с новыми данными ---
+        activity_hierarchy = self.db_manager.get_activity_hierarchy()
+        aggregated_work_time = defaultdict(int)
+        aggregated_break_time = defaultdict(int)
 
-        # 5. Recursive function to traverse hierarchy and aggregate time
-        def process_node(node):
+        # Функция агрегации времени (включая дочерние) - теперь считает оба типа
+        def aggregate_time_recursive(node):
             activity_id = node['id']
-            activity_nodes_map[activity_id] = node # Store node in map
+            node_work_time = work_time_by_activity_id.get(activity_id, 0)
+            node_break_time = break_time_by_activity_id.get(activity_id, 0)
 
-            # Time directly recorded for this activity
-            current_node_direct_time = direct_time_by_activity_id.get(activity_id, 0)
-            total_time_for_node = current_node_direct_time
-
-            # Recursively process child nodes
             for child_node in node['children']:
-                child_total_time = process_node(child_node)
-                total_time_for_node += child_total_time # Add descendants' time to parent
+                child_work, child_break = aggregate_time_recursive(child_node)
+                node_work_time += child_work
+                node_break_time += child_break
 
-            aggregated_time_by_activity_id[activity_id] = total_time_for_node
-            return total_time_for_node
+            aggregated_work_time[activity_id] = node_work_time
+            aggregated_break_time[activity_id] = node_break_time
+            return node_work_time, node_break_time
 
-        # Start processing for all top-level nodes
         for top_level_node in activity_hierarchy:
-            process_node(top_level_node)
+            aggregate_time_recursive(top_level_node)
 
-        # 6. Recursive function to build the QTreeWidget summary
+        # Функция построения дерева
         def build_summary_tree(parent_item, nodes):
-             for node_data in nodes:
-                 activity_id = node_data['id']
-                 activity_name = node_data['name']
-                 total_seconds = aggregated_time_by_activity_id.get(activity_id, 0)
+            for node_data in nodes:
+                activity_id = node_data['id']
+                activity_name = node_data['name'] # Имя из иерархии
+                work_seconds = aggregated_work_time.get(activity_id, 0)
+                break_seconds = aggregated_break_time.get(activity_id, 0)
+                total_seconds = work_seconds + break_seconds
 
-                 # Add item to the tree only if time was spent on it or its descendants
-                 if total_seconds > 0:
-                     formatted_total_duration = MainWindow.format_time(None, total_seconds)
+                # Добавляем только если было какое-то время
+                if total_seconds > 0:
+                    fmt_work = MainWindow.format_time(None, work_seconds)
+                    fmt_break = MainWindow.format_time(None, break_seconds)
+                    fmt_total = MainWindow.format_time(None, total_seconds)
 
-                     tree_item = QTreeWidgetItem(parent_item)
-                     tree_item.setText(0, activity_name) # Activity name
-                     tree_item.setText(1, formatted_total_duration) # Aggregated time
-                     tree_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                    tree_item = QTreeWidgetItem(parent_item)
+                    tree_item.setText(0, activity_name) # Activity
+                    tree_item.setText(1, fmt_work)    # Work Time
+                    tree_item.setText(2, fmt_break)   # Break Time
+                    tree_item.setText(3, fmt_total)   # Total Time
 
-                     # Store numeric seconds value for sorting in the second column
-                     tree_item.setData(1, Qt.ItemDataRole.UserRole, total_seconds)
-                     # Store activity ID for potential future actions
-                     tree_item.setData(0, Qt.ItemDataRole.UserRole, activity_id)
+                    # Выравнивание
+                    tree_item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+                    tree_item.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
+                    tree_item.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
 
-                     # Recursively build for child nodes
-                     if node_data['children']:
-                         build_summary_tree(tree_item, node_data['children'])
+                    # Данные для сортировки (используем общее время для главной сортировки)
+                    tree_item.setData(1, Qt.ItemDataRole.UserRole, work_seconds)
+                    tree_item.setData(2, Qt.ItemDataRole.UserRole, break_seconds)
+                    tree_item.setData(3, Qt.ItemDataRole.UserRole, total_seconds)
+                    tree_item.setData(0, Qt.ItemDataRole.UserRole, activity_id)
 
-        # Build the tree starting from the QTreeWidget's invisible root item
+                    if node_data['children']:
+                        build_summary_tree(tree_item, node_data['children'])
+
         build_summary_tree(self.summary_tree.invisibleRootItem(), activity_hierarchy)
-        self.summary_tree.expandAll() # Expand all nodes by default
+        self.summary_tree.expandAll()
         self.summary_tree.setSortingEnabled(True)
-        # Restore default sorting (by time descending)
-        self.summary_tree.sortByColumn(1, Qt.SortOrder.DescendingOrder)
+        self.summary_tree.sortByColumn(3, Qt.SortOrder.DescendingOrder) # Сортируем по Total Time
+        # --- КОНЕЦ ИЗМЕНЕНИЯ в построении дерева ---
 
-        # 7. Update the label with the total time for the day
-        formatted_total_duration_day = MainWindow.format_time(None, total_duration_day_seconds)
-        self.summary_label.setText(f"Total time for the day: {formatted_total_duration_day}")
-        print(f"Snapshot for {selected_date} loaded. Entries: {len(entries)}. Total time: {formatted_total_duration_day}")
+        # Обновляем итоговую метку (показываем ОБЩЕЕ рабочее время)
+        formatted_total_work_day = MainWindow.format_time(None, total_work_day_seconds)
+        self.summary_label.setText(f"Total WORK time for the day: {formatted_total_work_day}")
+        print(f"Snapshot for {selected_date} loaded. Entries: {len(entries)}. Total work time: {formatted_total_work_day}")# --- NEW: Configure Habit Dialog ---
 
-# --- NEW: Configure Habit Dialog ---
 class ConfigureHabitDialog(QDialog):
     def __init__(self, activity_id, activity_name, current_config, db_manager, parent=None):
         super().__init__(parent)
@@ -2126,6 +2252,7 @@ class HabitTableModel(QAbstractTableModel):
              return False
 # --- End of HabitTableModel ---
 
+
 class HabitTrackerDialog(QDialog):
     # Optional: Define a signal if this dialog needs to inform others of changes
     # habits_logged_signal = pyqtSignal(int, str) # activity_id, date_str
@@ -2414,452 +2541,157 @@ class HabitTrackerDialog(QDialog):
             # else: View updates automatically via model's dataChanged signal
 # --- End of HabitTrackerDialog Class ---
 
-# --- Main Window (Significant changes) ---
 class MainWindow(QMainWindow):
     habits_updated = pyqtSignal()
+
+    # TimerWindow states (kept for clarity, used within task_data)
+    STATE_TRACKING = 0
+    STATE_PAUSED = 1
+
     def __init__(self):
         super().__init__()
         self.db_manager = DatabaseManager()
-        self.timer_window = TimerWindow()
-        self.qtimer = QTimer(self)
+        self.qtimer = QTimer(self) # One global QTimer for UI updates
         self.qtimer.timeout.connect(self.update_timer)
-        self.current_activity_id = None
-        self.current_activity_name = None
-        self.timer_type = None # 'work' or 'countdown'
-        self.start_time = None
-        self.countdown_average_duration = 0 # The average duration used for the current countdown
-        self.average_duration_at_countdown_start = 0 # Average for the *specific* activity when countdown started
+
+        # --- State Variables ---
+        self.selected_activity_details = [] # List of selected: [(id, name), ...]
+        self.active_timer_windows = {}      # Active tasks: {activity_id: task_data_dict}
+        # task_data_dict = {'window': TimerWindow_instance, 'state': int,
+        #                   'current_interval_start_time': float,
+        #                   'total_session_work_sec': float, 'total_session_break_sec': float,
+        #                   'session_id': float, # Unique ID for this task instance (start time)
+        #                   'activity_name': str }
+
+          # --- Multi-tasking window colors ---
+        self._multitask_color_index = 0
+        self.multitask_colors = [
+             QColor(0, 0, 0, 180), QColor(90, 0, 0, 190), QColor(90, 45, 0, 190),
+             QColor(0, 70, 0, 190), QColor(0, 70, 70, 190), QColor(0, 0, 90, 190),
+             QColor(60, 0, 90, 190)
+        ]
 
         # --- UI Elements ---
         self.activity_tree = None
         self.manage_entries_button = None
         self.snapshot_button = None
-        self.habit_tracker_button = None # <-- New Button
-        self.work_timer_button = None
-        self.countdown_timer_button = None
+        self.habit_tracker_button = None
+        self.start_tasks_button = None
+        self.start_countdowns_button = None # <<< MODIFICATION: Renamed
         self.status_label = None
         self.heatmap_widget = None
-        
+
         self.init_ui()
         self.apply_dark_theme()
         self.load_activities()
 
-        # --- Connect Signal to Heatmap Refresh ---
-        if self.heatmap_widget: # Ensure it was created in init_ui
-             self.habits_updated.connect(self.heatmap_widget.refresh_data)
-             print("Connected habits_updated signal to heatmap refresh.")
-        # -----------------------------------------
+        if self.heatmap_widget:
+            self.habits_updated.connect(self.heatmap_widget.refresh_data)
+            print("Connected habits_updated signal to heatmap refresh.")
 
     def init_ui(self):
-        self.setWindowTitle("Ritual 0.08 - Habit Tracker") # Version bump
-        self.setGeometry(100, 100, 750, 650) # Slightly larger
+        self.setWindowTitle("Ritual - Time Tracker")
+        self.setGeometry(100, 100, 750, 650)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
         # --- Activity Tree ---
-        main_layout.addWidget(QLabel("Activities (Right-click to add/manage):"))
+        main_layout.addWidget(QLabel("Activities (Right-click; Ctrl/Shift to multi-select):"))
         self.activity_tree = QTreeWidget()
         self.activity_tree.setColumnCount(1)
         self.activity_tree.setHeaderHidden(True)
-        self.activity_tree.currentItemChanged.connect(self.activity_selected)
+        self.activity_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.activity_tree.itemSelectionChanged.connect(self.handle_selection_change)
         self.activity_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.activity_tree.customContextMenuRequested.connect(self.show_activity_context_menu)
         self.activity_tree.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
-        main_layout.addWidget(self.activity_tree, 1) # Give tree some stretch factor
+        main_layout.addWidget(self.activity_tree, 1)
 
         # --- Management Buttons ---
         management_layout = QHBoxLayout()
         self.manage_entries_button = QPushButton("Manage Entries")
         self.manage_entries_button.clicked.connect(self.open_entry_management)
-        self.manage_entries_button.setEnabled(False)
+        self.manage_entries_button.setEnabled(False) # Controlled by selection
 
         self.snapshot_button = QPushButton("Daily Snapshot")
         self.snapshot_button.clicked.connect(self.open_daily_snapshot)
 
-        # --- NEW Habit Tracker Button ---
         self.habit_tracker_button = QPushButton("Habit Tracker")
-        self.habit_tracker_button.clicked.connect(self.open_habit_tracker) # Connect slot
+        self.habit_tracker_button.clicked.connect(self.open_habit_tracker)
 
         management_layout.addWidget(self.manage_entries_button)
         management_layout.addWidget(self.snapshot_button)
-        management_layout.addWidget(self.habit_tracker_button) # Add to layout
+        management_layout.addWidget(self.habit_tracker_button)
         main_layout.addLayout(management_layout)
 
         # --- Timer Buttons ---
         timer_buttons_layout = QHBoxLayout()
-        self.work_timer_button = QPushButton("Start Tracking")
-        self.work_timer_button.setCheckable(True)
-        self.work_timer_button.clicked.connect(self.toggle_timer)
-        self.work_timer_button.setEnabled(False)
+        self.start_tasks_button = QPushButton("Start Selected Task(s)")
+        self.start_tasks_button.clicked.connect(self.start_selected_tasks)
+        self.start_tasks_button.setEnabled(False)
 
-        self.countdown_timer_button = QPushButton("Start Countdown")
-        self.countdown_timer_button.clicked.connect(self.start_countdown_timer)
-        self.countdown_timer_button.setEnabled(False)
+        # Используем новое имя переменной и текст кнопки
+        self.start_countdowns_button = QPushButton("Start Selected Countdown(s)")
+        # <<< ИСПРАВЛЕНИЕ: Подключаемся к правильному методу >>>
+        self.start_countdowns_button.clicked.connect(self.start_selected_countdowns)
+        self.start_countdowns_button.setEnabled(False)
 
-        timer_buttons_layout.addWidget(self.work_timer_button)
-        timer_buttons_layout.addWidget(self.countdown_timer_button)
+        timer_buttons_layout.addWidget(self.start_tasks_button)
+        # Используем новое имя переменной при добавлении в layout
+        timer_buttons_layout.addWidget(self.start_countdowns_button)
         main_layout.addLayout(timer_buttons_layout)
-
+        
         # --- Status Bar ---
-        self.status_label = QLabel("Select an activity")
+        self.status_label = QLabel("Select activity(-ies)")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.status_label)
-        
-        # --- NEW: Heatmap Widget ---
-        main_layout.addWidget(QLabel("Yearly Habit Heatmap:")) # Add a label
+
+        # --- Heatmap Widget ---
+        main_layout.addWidget(QLabel("Yearly Habit Heatmap:"))
         self.heatmap_widget = HeatmapWidget(self.db_manager, self)
-        main_layout.addWidget(self.heatmap_widget, 0) # Add heatmap, no stretch factor initially
-        # --------------------------
+        main_layout.addWidget(self.heatmap_widget, 0)
 
     def apply_dark_theme(self):
-            # (Theme code remains unchanged from previous version)
-            dark_palette = QPalette()
-            dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-            # ... (rest of palette setup) ...
-            dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor(45, 45, 45)) # Slightly different disabled background
+        # (Your existing dark theme code remains here)
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+        # ... (rest of your palette settings) ...
+        dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor(45, 45, 45))
+        app = QApplication.instance()
+        if app:
+            app.setPalette(dark_palette)
+            # app.setStyleSheet(...) # Your stylesheet if any
 
-            app = QApplication.instance()
-            if app:
-                app.setPalette(dark_palette)
-                # Stylesheet (ensure it covers new elements if needed)
-                # --- Start commenting out sections below to debug ---
-                app.setStyleSheet("""
-                    QMainWindow { border: none; background-color: #353535; }
-                    QWidget { color: white; background-color: #353535; } /* Default for widgets */
-                    QDialog { background-color: #353535; } /* Ensure dialogs inherit */
-
-                #    QPushButton {
-                #        border: 1px solid #555; padding: 6px 12px; min-height: 20px;
-                #        background-color: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #555, stop: 1 #444);
-                #        color: white; border-radius: 4px;
-                #    }
-                #    QPushButton:hover { background-color: #5E5E5E; }
-                #    QPushButton:pressed { background-color: #707070; border: 1px solid #666; }
-                #    QPushButton:checked { background-color: #4CAF50; border: 1px solid #3a8a40; } /* Used for Start/Stop state */
-                #    QPushButton:disabled { background-color: #4F4F4F; color: #888; border: 1px solid #4F4F4F;}
-
-                #    QLineEdit, QSpinBox, QDateTimeEdit, QDateEdit, QRadioButton, QCheckBox {
-                #        border: 1px solid #555; padding: 5px; background-color: #2D2D2D; color: white;
-                #        border-radius: 3px; selection-background-color: #2a82da; selection-color: white;
-                #    }
-                #    /* Specific overrides for Radio/Check background */
-                #    QRadioButton, QCheckBox { background-color: transparent; border: none; }
-                #    QRadioButton::indicator, QCheckBox::indicator { width: 13px; height: 13px; }
-                #    /* Add more specific styles if needed for indicators */
-
-                #    QLineEdit:focus, QSpinBox:focus, QDateTimeEdit:focus, QDateEdit:focus {
-                #            border: 1px solid #2a82da;
-                #    }
-                #    QLineEdit:disabled, QSpinBox:disabled, QDateTimeEdit:disabled, QDateEdit:disabled {
-                #        background-color: #454545; color: #888;
-                #    }
-
-                    /* Styles for QTreeWidget */
-                #    QTreeWidget {
-                #        border: 1px solid #555;
-                #        background-color: #2D2D2D; /* Base color from palette */
-                #        color: white;
-                #        alternate-background-color: #353535; /* Alternate color from palette */
-                #        selection-background-color: #2a82da; /* Highlight color */
-                #        selection-color: white; /* Highlighted text color */
-                #        outline: none; /* Removes focus dotted border */
-                #    }
-                #    QTreeWidget::item { padding: 4px; border-bottom: 1px solid #444; }
-                #    QTreeWidget::item:selected { background-color: #2a82da; color: white; }
-                #    /* QTreeWidget::item:alternate { background-color: #353535; } /* Already handled by alternate-background-color */ */
-                #     /* Styles for tree branches */
-                #     QTreeView::branch { background: transparent; }
-                #     QTreeView::branch:has-children:!has-siblings:closed,
-                #     QTreeView::branch:closed:has-children:has-siblings {
-                #          border-image: none;
-                #          image: url(:/qt-project.org/styles/commonstyle/images/branch-closed-16.png); /* Standard PyQt icon */
-                #     }
-                #     QTreeView::branch:open:has-children:!has-siblings,
-                #     QTreeView::branch:open:has-children:has-siblings  {
-                #          border-image: none;
-                #          image: url(:/qt-project.org/styles/commonstyle/images/branch-open-16.png); /* Standard PyQt icon */
-                #     }
-
-                #    QHeaderView::section {
-                #        background-color: #444; color: white; padding: 5px;
-                #        border: 1px solid #555; border-bottom: 2px solid #666; font-weight: bold;
-                #    }
-                #    QHeaderView::section:checked { background-color: #2a82da; }
-
-                #    QDateEdit::drop-down, QDateTimeEdit::drop-down {
-                #        subcontrol-origin: padding; subcontrol-position: top right; width: 18px;
-                #        border-left-width: 1px; border-left-color: #555; border-left-style: solid;
-                #        border-top-right-radius: 3px; border-bottom-right-radius: 3px;
-                #        background-color: #444;
-                #    }
-                #    /* QDateEdit::down-arrow { image: url(path/to/icon.png); } */
-
-                #    QDateEdit QAbstractItemView, QDateTimeEdit QAbstractItemView {
-                #        background-color: #2D2D2D; selection-background-color: #2a82da;
-                #        color: white; outline: 1px solid #555; border: none;
-                #    }
-                #     QCalendarWidget QWidget#qt_calendar_navigationbar { background-color: #444; }
-                #     QCalendarWidget QToolButton { color: white; background-color: #555; border: none; margin: 2px; padding: 3px; }
-                #     QCalendarWidget QToolButton:hover { background-color: #666; }
-                #     QCalendarWidget QMenu { background-color: #2D2D2D; color: white; }
-                #     QCalendarWidget QSpinBox { background-color: #2D2D2D; color: white; }
-                #     QCalendarWidget QWidget { alternate-background-color: #353535; } /* Day colors */
-                #     QCalendarWidget QAbstractItemView:enabled { color: white; selection-background-color: #2a82da; } /* Text and selection color */
-                #     QCalendarWidget QAbstractItemView:disabled { color: #888; } /* Other month days color */
-
-                #    QSplitter { background-color: #353535; }
-                #    QSplitter::handle:vertical { background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #666, stop:1 #555); height: 7px; border-top: 1px solid #777; border-bottom: 1px solid #444; margin: 1px 0; }
-                #    QSplitter::handle:vertical:hover { background-color: #777; }
-                #    QSplitter::handle:horizontal { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #666, stop:1 #555); width: 7px; border-left: 1px solid #777; border-right: 1px solid #444; margin: 0 1px; }
-                #    QSplitter::handle:horizontal:hover { background-color: #777; }
-
-                #    QLabel { padding: 2px; color: white; background-color: transparent;}
-
-                #    QDialogButtonBox QPushButton { min-width: 80px; }
-
-                    /* Input Dialog Styles (make inputs readable) */
-                #    QInputDialog { background-color: #353535; color: white; }
-                #    QInputDialog QLabel { color: white; }
-                #    QInputDialog QLineEdit { background-color: #FFF; color: black; border: 1px solid #AAA; padding: 4px; }
-                #    QInputDialog QSpinBox { background-color: #FFF; color: black; border: 1px solid #AAA; padding: 4px; }
-                #    QInputDialog QDateTimeEdit { background-color: #FFF; color: black; border: 1px solid #AAA; padding: 4px; }
-                #    QInputDialog QDateEdit { background-color: #FFF; color: black; border: 1px solid #AAA; padding: 4px; }
-                #    QInputDialog QDoubleSpinBox { background-color: #FFF; color: black; border: 1px solid #AAA; padding: 4px; } # <-- Add if using QInputDialog.getDouble
-                #    QInputDialog QPushButton { color: white; background-color: #555; border: 1px solid #666; padding: 5px; min-width: 70px; }
-                #    QInputDialog QPushButton:hover { background-color: #6E6E6E; }
-                #    QInputDialog QPushButton:pressed { background-color: #808080; }
-
-                #    QMessageBox { background-color: #353535; }
-                #    QMessageBox QLabel { color: white; padding: 15px; qproperty-alignment: 'AlignCenter'; }
-                #    QMessageBox QPushButton { min-width: 80px; padding: 6px 12px; }
-
-                    /* Styles for QMenu */
-                #     QMenu { background-color: #2D2D2D; border: 1px solid #555; color: white; padding: 5px; }
-                #     QMenu::item { padding: 5px 25px 5px 20px; border: 1px solid transparent; }
-                #     QMenu::item:selected { background-color: #2a82da; color: white; }
-                #     QMenu::separator { height: 1px; background: #555; margin: 2px 10px; }
-                #     QMenu::indicator { width: 13px; height: 13px; }
-
-                    /* Table Widget specific style */
-                #     QTableWidget { /* Applies to QTableView too unless overridden */
-                #          border: 1px solid #555; background-color: #2D2D2D; color: white;
-                #          alternate-background-color: #353535; gridline-color: #444;
-                #          selection-background-color: #2a82da; selection-color: white; outline: none;
-                #     }
-                #     QTableView { /* More specific for your habit grid */
-                #          border: 1px solid #555; background-color: #2D2D2D; color: white;
-                #          alternate-background-color: #353535; gridline-color: #444;
-                #          selection-background-color: #2a82da; selection-color: white; outline: none;
-                #     }
-                #     QTableView::item { padding: 2px; border: none;} /* Adjust padding for habit grid, remove default borders if any */
-                    /* Selection handled by delegate / option.state */
-                    /* QTableWidget::item:selected { background-color: #2a82da; color: white; } */
-                """)
     def load_activities(self):
-        """Loads the activity hierarchy into the QTreeWidget."""
+        """Loads/reloads the activity hierarchy."""
         self.activity_tree.clear()
-        self.activity_tree.setSortingEnabled(False) # Disable sorting during load
-
-        # Get hierarchy: [{id:.., name:.., parent:.., children:[...], habit_type:.., habit_unit:..}, ...]
+        self.activity_tree.setSortingEnabled(False)
         hierarchy = self.db_manager.get_activity_hierarchy()
 
-        # Recursive function to add nodes to the tree
         def add_items_recursive(parent_widget_item, activity_nodes):
-            for node in activity_nodes:
-                item = QTreeWidgetItem(parent_widget_item)
-                # Optionally indicate habits in the tree visually (e.g., icon or suffix)
-                prefix = ""
-                if node['habit_type'] is not None:
-                    prefix = "[H] " # Simple indication
-                    # Or set an icon: item.setIcon(0, habit_icon)
+             for node in activity_nodes:
+                 item = QTreeWidgetItem(parent_widget_item)
+                 prefix = "[H] " if node.get('habit_type') is not None and node.get('habit_type') != HABIT_TYPE_NONE else ""
+                 item.setText(0, prefix + node['name'])
+                 item.setData(0, Qt.ItemDataRole.UserRole, node['id'])
+                 if node.get('children'):
+                     add_items_recursive(item, node['children'])
 
-                item.setText(0, prefix + node['name'])
-                item.setData(0, Qt.ItemDataRole.UserRole, node['id']) # Store activity ID
-                # Store habit config on item too for easy access in context menu
-                item.setData(0, HABIT_TYPE_ROLE, node['habit_type'])  # CORRECTED: Added column index 0
-                item.setData(0, HABIT_UNIT_ROLE, node['habit_unit'])  # CORRECTED: Added column index 0
-
-                # Recursively add child elements
-                if node['children']:
-                    add_items_recursive(item, node['children'])
-
-        # Add nodes starting from the tree's invisible root item
         add_items_recursive(self.activity_tree.invisibleRootItem(), hierarchy)
 
-        self.activity_tree.expandAll() # Expand all nodes
-        self.activity_tree.setSortingEnabled(True) # Enable sorting (by name, column 0)
+        self.activity_tree.expandAll()
+        self.activity_tree.setSortingEnabled(True)
         self.activity_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
 
-        if not hierarchy:
-            self.status_label.setText("Add the first activity (Right-click empty space)")
-        else:
-            self.status_label.setText("Select an activity")
-        self.activity_selected(None) # Reset selection and update buttons
-
-    def show_activity_context_menu(self, position):
-        """Displays the context menu for the activity tree."""
-        menu = QMenu(self)
-        selected_item = self.activity_tree.currentItem()
-        selected_id = selected_item.data(0, Qt.ItemDataRole.UserRole) if selected_item else None
-
-        # --- Actions always available ---
-        add_top_level_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), "Add Top-Level Activity", self)
-        add_top_level_action.triggered.connect(lambda: self.add_activity_action(parent_id=None))
-        menu.addAction(add_top_level_action)
-
-        # --- Actions available when an item is selected ---
-        if selected_item:
-            menu.addSeparator()
-
-            # Add Sub-Activity
-            add_sub_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), f"Add Sub-Activity to '{selected_item.text(0)}'", self)
-            add_sub_action.triggered.connect(lambda: self.add_activity_action(parent_id=selected_id))
-            menu.addAction(add_sub_action)
-
-            menu.addSeparator()
-
-            # Rename
-            rename_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "Rename", self)
-            rename_action.triggered.connect(self.rename_activity_action)
-            menu.addAction(rename_action)
-
-            # --- NEW: Configure Habit ---
-            config_habit_action = QAction(QIcon.fromTheme("preferences-system", QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)), "Configure as Habit...", self) # Use a config-like icon
-            config_habit_action.triggered.connect(self.configure_habit_action)
-            menu.addAction(config_habit_action)
-
-            menu.addSeparator()
-
-            # Delete
-            delete_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon), "Delete", self)
-            delete_action.triggered.connect(self.delete_activity_action)
-            menu.addAction(delete_action)
-
-        menu.exec(self.activity_tree.viewport().mapToGlobal(position))
-
-    def add_activity_action(self, parent_id=None):
-        """Handler for the add activity action (from menu)."""
-        parent_name_suffix = ""
-        if parent_id:
-            item = self._find_tree_item_by_id(parent_id)
-            if item: parent_name_suffix = f" under '{item.text(0)}'"
-
-        text, ok = QInputDialog.getText(self, "Add Activity", f"Enter name for the new activity{parent_name_suffix}:")
-        if ok and text.strip():
-            new_activity_id = self.db_manager.add_activity(text.strip(), parent_id)
-            if new_activity_id is not None:
-                self.load_activities() # Reload tree
-                new_item = self._find_tree_item_by_id(new_activity_id)
-                if new_item: self.activity_tree.setCurrentItem(new_item)
-                # --- Emit Signal ---
-                # Emitting here assumes adding *any* activity might be relevant
-                # If only adding *habits* should trigger, check type before emitting
-                self.habits_updated.emit()
-                print("MainWindow emitted habits_updated after add.")
-        elif ok: # Clicked OK, but text is empty
-             QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
-
-    def rename_activity_action(self):
-        """Handler for the rename activity action."""
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
-
-        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
-        # Get name without prefix if it exists
-        current_display_name = selected_item.text(0)
-        current_name = current_display_name.replace("[H] ", "", 1) if current_display_name.startswith("[H] ") else current_display_name
-
-        parent_item = selected_item.parent()
-        parent_id = parent_item.data(0, Qt.ItemDataRole.UserRole) if parent_item and self.activity_tree.indexOfTopLevelItem(parent_item) == -1 else None
-
-        new_name, ok = QInputDialog.getText(self, "Rename Activity", "Enter new name:", QLineEdit.EchoMode.Normal, current_name)
-
-        if ok and new_name.strip() and new_name.strip() != current_name:
-             db_parent_id = self.db_manager.get_activity_parent_id(activity_id)
-             if self.db_manager.update_activity_name(activity_id, new_name.strip(), db_parent_id):
-                 # Update item text in the tree (keeping prefix if it was there)
-                 prefix = "[H] " if current_display_name.startswith("[H] ") else ""
-                 selected_item.setText(0, prefix + new_name.strip())
-                 # Update status if it was the selected activity
-                 if activity_id == self.current_activity_id:
-                     self.current_activity_name = new_name.strip() # Store name without prefix
-                     self.activity_selected(selected_item) # Will update status bar text
-        elif ok and not new_name.strip():
-             QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
-
-    # --- NEW: Configure Habit Action ---
-    def configure_habit_action(self):
-        """Handler for the configure habit action."""
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
-
-        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
-        # Get name without prefix for dialog title
-        display_name = selected_item.text(0)
-        activity_name = display_name.replace("[H] ", "", 1) if display_name.startswith("[H] ") else display_name
-
-        # Get current config from DB for accuracy
-        current_config = self.db_manager.get_activity_habit_config(activity_id)
-
-        dialog = ConfigureHabitDialog(activity_id, activity_name, current_config, self.db_manager, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            print(f"Habit config potentially updated for {activity_name}. Reloading activities.")
-            self.load_activities() # Reload tree
-            new_item = self._find_tree_item_by_id(activity_id)
-            if new_item: self.activity_tree.setCurrentItem(new_item)
-            # --- Emit Signal ---
-            self.habits_updated.emit()
-            print("MainWindow emitted habits_updated after configure.")
-
-    def delete_activity_action(self):
-        """Handler for the delete activity action."""
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
-
-        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
-        activity_name = selected_item.text(0)
-        base_activity_name = activity_name.replace("[H] ", "", 1) if activity_name.startswith("[H] ") else activity_name
-
-        warning_message = ""
-        all_descendants = self.db_manager.get_descendant_activity_ids(activity_id)
-        descendant_count = len(all_descendants) - 1 if activity_id in all_descendants else len(all_descendants)
-
-        if descendant_count > 0:
-            warning_message = f"\n\nWARNING: This will also delete all {descendant_count} child activities!"
-
-        # Add warning about associated data
-        warning_message += "\nAll associated time entries and habit logs will also be deleted!"
-
-        reply = QMessageBox.question(
-            self, "Confirm Deletion",
-            f"Are you sure you want to delete activity '{base_activity_name}' (ID: {activity_id})?{warning_message}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-             # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-             # Принимаем все три значения, игнорируем второе и третье
-             was_habit, _, _ = self.db_manager.get_activity_habit_config(activity_id)
-             # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-             is_habit = was_habit is not None and was_habit != HABIT_TYPE_NONE
-
-             if self.db_manager.delete_activity(activity_id):
-                 if activity_id == self.current_activity_id:
-                     self.current_activity_id = None
-                     self.current_activity_name = None
-                 self.load_activities() # Reload tree
-                 if is_habit:
-                      self.habits_updated.emit()
-                      print("MainWindow emitted habits_updated after delete.")
-             else:
-                 QMessageBox.critical(self, "Deletion Error", f"Failed to delete activity '{base_activity_name}'. Check console for details.")
+        # Reset selection and update UI
+        self.activity_tree.clearSelection()
+        self.selected_activity_details = []
+        self.update_ui_for_selection() # Update buttons and status bar
 
     def _find_tree_item_by_id(self, activity_id):
-        """Helper method to find a QTreeWidgetItem by activity ID."""
+        """Helper to find a tree item by its stored activity ID."""
         if activity_id is None: return None
         iterator = QTreeWidgetItemIterator(self.activity_tree)
         while iterator.value():
@@ -2869,414 +2701,922 @@ class MainWindow(QMainWindow):
             iterator += 1
         return None
 
-    def activity_selected(self, current_item, previous_item=None): # PyQt passes both
-        """Handler for item selection in QTreeWidget."""
-        # --- Logic to prevent changing selection if timer is active ---
-        if self.qtimer.isActive():
-            is_different_item = current_item and current_item.data(0, Qt.ItemDataRole.UserRole) != self.current_activity_id
-            is_deselected = not current_item and self.current_activity_id is not None
+    def _get_next_multitask_color(self):
+        """Cycles through the defined colors for new timer windows."""
+        color = self.multitask_colors[self._multitask_color_index % len(self.multitask_colors)]
+        self._multitask_color_index += 1
+        return color
 
-            if is_different_item or is_deselected:
-                # Restore selection to the previously active item
-                previous_valid_item = self._find_tree_item_by_id(self.current_activity_id)
-                if previous_valid_item:
-                    self.activity_tree.blockSignals(True) # Block signals during set
-                    self.activity_tree.setCurrentItem(previous_valid_item)
-                    self.activity_tree.blockSignals(False) # Unblock
-                if is_different_item:
-                     QMessageBox.warning(self, "Timer Active", "Stop the timer before changing the activity.")
-                return # Interrupt further selection processing
+    def handle_selection_change(self):
+        """Updates the internal list of selected activities and the UI."""
+        # <<< MODIFICATION: No longer blocked by active timers >>>
+        selected_items = self.activity_tree.selectedItems()
+        self.selected_activity_details = []
+        for item in selected_items:
+            item_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if item_id is not None:
+                display_name = item.text(0)
+                actual_name = display_name.replace("[H] ", "", 1) if display_name.startswith("[H] ") else display_name
+                self.selected_activity_details.append((item_id, actual_name))
+        self.update_ui_for_selection()
 
-        # --- Update UI if timer is not active or the same item is clicked ---
-        if current_item:
-            self.current_activity_id = current_item.data(0, Qt.ItemDataRole.UserRole)
-            # Get name without prefix
-            display_name = current_item.text(0)
-            self.current_activity_name = display_name.replace("[H] ", "", 1) if display_name.startswith("[H] ") else display_name
+    def update_ui_for_selection(self):
+        """Updates buttons and status bar based on current selection and timer state."""
+        # <<< MODIFICATION: Simplified and adapted for multi-tasking >>>
+        num_selected = len(self.selected_activity_details)
+        is_single_selection = num_selected == 1
+        is_any_selection = num_selected >= 1
 
-            # Calculate average time only for *this* specific activity
-            avg_duration_specific = self.db_manager.calculate_average_duration(self.current_activity_id)
-            # Calculate total time for the branch (including children) - just for info
-            total_duration_branch = self.db_manager.calculate_total_duration_for_activity_branch(self.current_activity_id)
+        # --- Update Status Label ---
+        avg_duration_specific = 0 # Used for countdown check and status text
+        status_text = "Select activity(-ies)"
+        if is_single_selection:
+            single_id, single_name = self.selected_activity_details[0]
+            try:
+                # Fetch stats only if needed for status or countdown button state
+                avg_duration_specific = self.db_manager.calculate_average_duration(single_id)
+                total_duration_branch = self.db_manager.calculate_total_duration_for_activity_branch(single_id)
+                avg_text = f"Avg: {self.format_time(None, avg_duration_specific)}" if avg_duration_specific > 0 else "Avg: N/A"
+                total_text = f"Branch Total: {self.format_time(None, total_duration_branch)}"
+                status_text = f"Selected: {single_name} ({avg_text} | {total_text})"
+            except Exception as e:
+                print(f"Error calculating stats for {single_name}: {e}")
+                status_text = f"Selected: {single_name} (Error getting stats)"
+        elif is_any_selection:
+            status_text = f"Selected: {num_selected} activities"
+        self.status_label.setText(status_text)
 
-            avg_text = f"Avg: {self.format_time(None, avg_duration_specific)}" if avg_duration_specific > 0 else "Avg: N/A"
-            total_text = f"Branch Total: {self.format_time(None, total_duration_branch)}"
+        # --- Update Button Enable States ---
+        any_timer_active = bool(self.active_timer_windows) or (self.countdown_activity_id is not None)
 
-            self.countdown_timer_button.setEnabled(avg_duration_specific > 0)
-            self.status_label.setText(f"Selected: {self.current_activity_name} ({avg_text} | {total_text})")
-            self.work_timer_button.setEnabled(True)
-            if self.manage_entries_button:
-                self.manage_entries_button.setEnabled(True)
-        else: # Nothing selected
-            self.current_activity_id = None
-            self.current_activity_name = None
-            self.status_label.setText("Select an activity")
-            self.work_timer_button.setEnabled(False)
-            self.countdown_timer_button.setEnabled(False)
-            if self.manage_entries_button:
-                self.manage_entries_button.setEnabled(False)
+        # Start Tasks button enabled if anything is selected
+        self.start_tasks_button.setEnabled(is_any_selection)
 
-    def open_entry_management(self):
-        """Opens the entry management dialog for the SELECTED activity."""
-        if self.current_activity_id is None:
-            QMessageBox.warning(self, "Error", "Please select an activity in the tree first.")
+        # Countdown button enabled only for single selection with avg time, AND no other timers running
+        can_start_countdown = is_single_selection and avg_duration_specific > 0 and not any_timer_active
+        self.countdown_timer_button.setEnabled(can_start_countdown)
+        # Update countdown button text based on its *own* state
+        if self.countdown_activity_id is not None:
+             self.countdown_timer_button.setText("Stop Countdown")
+             self.countdown_timer_button.setEnabled(True) # Make sure stop is enabled
+        else:
+             self.countdown_timer_button.setText("Start Countdown")
+             # Enable state already set by can_start_countdown
+
+        # Manage Entries enabled only for single selection
+        if self.manage_entries_button:
+            self.manage_entries_button.setEnabled(is_single_selection)
+
+        # Other management buttons are generally always enabled
+        if self.snapshot_button: self.snapshot_button.setEnabled(True)
+        if self.habit_tracker_button: self.habit_tracker_button.setEnabled(True)
+        # Activity tree remains enabled always now
+        self.activity_tree.setEnabled(True)
+
+    def update_ui_for_selection(self):
+        """Updates buttons and status bar based on current selection and timer state."""
+        # <<< MODIFICATION: Updated countdown button logic >>>
+        num_selected = len(self.selected_activity_details)
+        is_single_selection = num_selected == 1
+        is_any_selection = num_selected >= 1
+
+        # --- Update Status Label (No changes needed here) ---
+        avg_duration_specific = 0
+        status_text = "Select activity(-ies)"
+        # ... (logic to calculate stats and set status_text) ...
+        self.status_label.setText(status_text)
+
+        # --- Update Button Enable States ---
+        # Check for different types of active timers
+        any_active_timers = bool(self.active_timer_windows)
+        work_timers_active = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
+        countdown_timers_active = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
+
+        # Start Tasks button enabled if selection exists AND no countdowns are active
+        self.start_tasks_button.setEnabled(is_any_selection and not countdown_timers_active)
+
+        # Start Countdowns button enabled if selection exists (with avg time) AND no work timers are active
+        has_selection_with_avg = any(self.db_manager.calculate_average_duration(aid) > 0 for aid, _ in self.selected_activity_details)
+        can_start_countdown = is_any_selection and has_selection_with_avg and not work_timers_active
+        self.start_countdowns_button.setEnabled(can_start_countdown)
+        # Note: Button text for countdowns is now static ("Start Selected Countdown(s)")
+
+        # Manage Entries enabled only for single selection
+        if self.manage_entries_button:
+            self.manage_entries_button.setEnabled(is_single_selection)
+
+        # Other management buttons are generally always enabled
+        if self.snapshot_button: self.snapshot_button.setEnabled(True)
+        if self.habit_tracker_button: self.habit_tracker_button.setEnabled(True)
+        # Activity tree remains enabled always
+        self.activity_tree.setEnabled(True)
+
+    # <<< MODIFICATION: Renamed from toggle_timer >>>
+    def start_selected_tasks(self):
+        """Starts work timers for selected activities that are not already running."""
+        # <<< MODIFICATION: Added check for active countdowns >>>
+        if any(task.get('is_countdown', False) for task in self.active_timer_windows.values()):
+            QMessageBox.warning(self, "Timer Busy", "Cannot start work tasks while countdown timers are active.")
             return
-        dialog = EntryManagementDialog(self.current_activity_id, self.current_activity_name, self.db_manager, self)
-        dialog.exec()
-        if dialog.needs_update:
-             print("Updating activity info after managing entries...")
-             current = self.activity_tree.currentItem()
-             if current: # Update the status bar text
-                 self.activity_selected(current)
+        # ... (rest of start_selected_tasks method remains the same as previous step) ...
+        if len(self.selected_activity_details) == 0:
+            QMessageBox.warning(self, "Error", "Please select at least one activity first.")
+            return
 
-    def open_daily_snapshot(self):
-        """Opens the 'Daily Snapshot' dialog."""
-        dialog = DailySnapshotDialog(self.db_manager, self)
-        dialog.exec()
+        qtimer_was_running = self.qtimer.isActive()
+        num_added = 0
+        default_font = self.activity_tree.font()
+        bold_font = QFont(default_font)
+        bold_font.setBold(True)
 
-    # --- NEW Slot to open Habit Tracker ---
-    def open_habit_tracker(self):
-        """Opens the 'Habit Tracker' dialog."""
-        # Pass self as parent so dialog can connect to signal
-        dialog = HabitTrackerDialog(self.db_manager, self)
-        dialog.exec()
-        # No need to reload activities here unless the dialog modifies them globally
+        for activity_id, activity_name in self.selected_activity_details:
+            if activity_id not in self.active_timer_windows:
+                print(f"Starting timer for: {activity_name} ({activity_id})")
+                task_start_time = time.time() # Use start time as unique session ID for this task
+                color = self._get_next_multitask_color()
+                new_timer = TimerWindow(initial_color=color, parent=self)
 
-    def toggle_timer(self):
-        """Toggles the main timer (Work/Stop or Countdown/Stop)."""
-        if self.work_timer_button.isChecked() and not self.qtimer.isActive():
-            # Attempting to start
-            if not self.current_activity_id:
-                QMessageBox.warning(self, "Error", "Please select an activity first.")
-                self.work_timer_button.setChecked(False) # Uncheck button
-                return
-            # Start the 'work' timer (countdown is started by its own button)
-            self.start_work_timer()
-        elif not self.work_timer_button.isChecked() and self.qtimer.isActive():
-            # Attempting to stop (button was unchecked by user click)
-            self.stop_timer_logic()
+                # Connect signals using lambda to capture the correct activity_id
+                new_timer.pause_requested.connect(lambda checked=False, aid=activity_id: self.handle_pause_request(aid))
+                new_timer.resume_requested.connect(lambda checked=False, aid=activity_id: self.handle_resume_request(aid))
+                new_timer.end_requested.connect(lambda checked=False, aid=activity_id: self.handle_end_request(aid))
 
-    def start_work_timer(self):
-        """Starts the 'Work' timer."""
-        if self.timer_type is not None or not self.current_activity_id: return
-        print(f"Starting 'Work' timer for: {self.current_activity_name} (ID: {self.current_activity_id})")
-        self.timer_type = 'work'
-        self.start_time = time.time()
-        self.timer_window.set_overrun(False)
-        self.qtimer.start(1000) # Update every second
-        self.timer_window.setText("00:00:00")
-        self.show_and_position_timer_window()
-        self.work_timer_button.setText("Stop Tracking") # Change button text
-        self.work_timer_button.setChecked(True) # Set state to "pressed"
-        self.set_controls_enabled(False) # Lock activity controls
-        self.status_label.setText(f"Working on: {self.current_activity_name}")
+                self.active_timer_windows[activity_id] = {
+                    'window': new_timer,
+                    'state': TimerWindow.STATE_TRACKING,
+                    'current_interval_start_time': task_start_time,
+                    'total_session_work_sec': 0,
+                    'total_session_break_sec': 0,
+                    'session_id': task_start_time, # Store unique start time as session ID
+                    'activity_name': activity_name,
+                    'is_countdown': False # Explicitly mark as not countdown
+                }
+                new_timer.showTrackingState("00:00:00", "00:00:00", activity_name)
 
-    def start_countdown_timer(self):
-        """Starts the 'Countdown' timer based on the SELECTED activity's average time."""
-        if not self.current_activity_id:
-             QMessageBox.warning(self, "Error", "Please select an activity first."); return
-        if self.qtimer.isActive():
-             QMessageBox.warning(self, "Timer Active", "Another timer is already running."); return
+                item_ref = self._find_tree_item_by_id(activity_id)
+                if item_ref:
+                    item_ref.setFont(0, bold_font)
 
-        average_duration = self.db_manager.calculate_average_duration(self.current_activity_id)
-        if average_duration <= 0:
-             QMessageBox.information(self, "Information", f"No average time data for '{self.current_activity_name}'. Cannot start countdown."); return
-
-        print(f"Starting 'Countdown' timer for: {self.current_activity_name} (ID: {self.current_activity_id}) from {average_duration:.0f} sec.")
-        self.timer_type = 'countdown'
-        self.countdown_average_duration = int(average_duration)
-        self.average_duration_at_countdown_start = self.countdown_average_duration # Store the initial average
-        self.start_time = time.time()
-        self.timer_window.set_overrun(False)
-        self.qtimer.start(1000)
-        self.timer_window.setText(self.format_time(None, self.countdown_average_duration))
-        self.show_and_position_timer_window()
-        self.work_timer_button.setText("Stop Countdown")
-        self.work_timer_button.setChecked(True)
-        self.work_timer_button.setEnabled(True)
-        self.set_controls_enabled(False)
-        self.status_label.setText(f"Countdown: {self.current_activity_name} (from {self.format_time(None, self.countdown_average_duration)})")
-
-    def stop_timer_logic(self):
-        """Common logic for stopping any type of timer, includes habit logging prompt."""
-        if not self.qtimer.isActive(): return
-        self.qtimer.stop()
-        self.timer_window.hide()
-        self.timer_window.set_overrun(False)
-        stop_time = time.time()
-        actual_duration = int(stop_time - self.start_time) if self.start_time else 0
-
-        # Save state before resetting
-        saved_activity_id = self.current_activity_id
-        saved_activity_name = self.current_activity_name # Name without prefix
-        timer_stopped_type = self.timer_type
-        avg_duration_at_start = self.average_duration_at_countdown_start
-
-        # Reset timer state
-        self.timer_type = None
-        self.start_time = None
-        self.countdown_average_duration = 0
-        self.average_duration_at_countdown_start = 0
-        needs_ui_update = False # Flag if status bar needs refresh
-
-        # Saving logic for time_entries
-        if timer_stopped_type == 'work':
-             if actual_duration > 0 and saved_activity_id is not None:
-                 print(f"Work timer stopped. Duration: {actual_duration} sec for '{saved_activity_name}'.")
-                 if self.db_manager.add_time_entry(saved_activity_id, actual_duration):
-                     needs_ui_update = True # Need to update average/total time
-             else:
-                 print("Work timer stopped without saving (duration 0 or no activity selected).")
-        elif timer_stopped_type == 'countdown':
-             print(f"Countdown timer stopped. Duration: {actual_duration} sec for '{saved_activity_name}'.")
-             if actual_duration > 0 and saved_activity_id is not None:
-                 # Check if we should prompt to save the time entry result
-                 if self.check_and_prompt_save_countdown(actual_duration, saved_activity_id, saved_activity_name, avg_duration_at_start):
-                     needs_ui_update = True # Saved time entry, need to update UI
-             else:
-                  print("Countdown timer stopped without saving (duration 0 or no activity selected).")
-
-        # --- NEW: Habit Logging Prompt ---
-        if saved_activity_id is not None and actual_duration >= 0: # Prompt even if duration is 0, as user intended to do it
-             habit_config = self.db_manager.get_activity_habit_config(saved_activity_id)
-             habit_type = habit_config[0] if habit_config else None
-
-             if habit_type is not None and habit_type != HABIT_TYPE_NONE:
-                 self.prompt_and_log_habit_after_timer(saved_activity_id, saved_activity_name, habit_config, actual_duration)
-                 # Note: Habit logging doesn't affect average time calculation shown in status bar, so no 'needs_ui_update' here.
-
-        # Restore button states and controls
-        self.work_timer_button.setText("Start Tracking")
-        self.work_timer_button.setChecked(False)
-        self.set_controls_enabled(True) # Unlock controls AFTER potentially logging habit
-
-        # Explicitly update selected activity status if time entry data was saved
-        if needs_ui_update:
-             current = self.activity_tree.currentItem()
-             if current:
-                 self.activity_selected(current) # Re-select to refresh the status bar
-             else:
-                 self.activity_selected(None)
-
-    # --- NEW: Helper for Habit Logging after Timer Stop ---
-    def prompt_and_log_habit_after_timer(self, activity_id, activity_name, habit_config, actual_duration_seconds):
-        habit_type, habit_unit, _ = habit_config
-        today_str = QDate.currentDate().toString("yyyy-MM-dd")
-
-        reply = QMessageBox.question(
-            self, "Log Habit?",
-            f"Activity '{activity_name}' is also tracked as a habit.\n\n"
-            f"Would you like to log its completion for today ({today_str}) based on the session?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return # User declined
-
-        new_value = None
-        ok_to_log = False
-
-        # --- Binary ---
-        if habit_type == HABIT_TYPE_BINARY:
-             bin_reply = QMessageBox.question(self, "Confirm Habit", f"Mark habit '{activity_name}' as DONE for today?",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
-             if bin_reply == QMessageBox.StandardButton.Yes:
-                 new_value = 1.0
-                 ok_to_log = True
-
-        # --- Percentage ---
-        elif habit_type == HABIT_TYPE_PERCENTAGE:
-             # Use a simple dialog with buttons for percentages
-             percent_dialog = QDialog(self)
-             percent_dialog.setWindowTitle(f"Log Percentage: {activity_name}")
-             p_layout = QVBoxLayout(percent_dialog)
-             p_layout.addWidget(QLabel(f"How much of '{activity_name}' did you complete today?"))
-             btn_layout = QHBoxLayout()
-             result = {'value': None} # Use dict to pass value out of lambda
-
-             percentages = [25.0, 50.0, 75.0, 100.0]
-             for p in percentages:
-                 button = QPushButton(f"{p:g}%")
-                 # Need lambda default arg trick to capture current 'p'
-                 button.clicked.connect(lambda checked=False, pct=p: (result.update({'value': pct}), percent_dialog.accept()))
-                 btn_layout.addWidget(button)
-
-             p_layout.addLayout(btn_layout)
-             cancel_button = QPushButton("Cancel")
-             cancel_button.clicked.connect(percent_dialog.reject)
-             p_layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignRight)
-
-             if percent_dialog.exec() == QDialog.DialogCode.Accepted and result['value'] is not None:
-                 new_value = result['value']
-                 ok_to_log = True
-
-        # --- Numeric ---
-        elif habit_type == HABIT_TYPE_NUMERIC:
-             prompt_text = f"Enter value for '{activity_name}'"
-             if habit_unit: prompt_text += f" ({habit_unit})"
-             prompt_text += f" for {today_str}:"
-
-             # Pre-fill with duration if unit seems time-related
-             default_value = 0.0
-             if habit_unit and habit_unit.lower() in ['minutes', 'min', 'm']:
-                 default_value = round(actual_duration_seconds / 60.0, 2)
-             elif habit_unit and habit_unit.lower() in ['hours', 'hrs', 'h']:
-                 default_value = round(actual_duration_seconds / 3600.0, 2)
-             elif habit_unit and habit_unit.lower() in ['seconds', 'sec', 's']:
-                 default_value = float(actual_duration_seconds)
-
-             num_value, ok = QInputDialog.getDouble(
-                 self, "Log Numeric Habit", prompt_text,
-                 value=default_value,
-                 min=-999999.0, max=999999.0, decimals=2 # Adjust as needed
-             )
-             if ok:
-                 new_value = num_value
-                 ok_to_log = True
-
-        # --- Log if confirmed ---
-        if ok_to_log:
-            if self.db_manager.log_habit(activity_id, today_str, new_value):
-                 QMessageBox.information(self, "Habit Logged", f"Habit '{activity_name}' logged successfully for today.")
-                 # --- Emit Signal ---
-                 self.habits_updated.emit()
-                 print("MainWindow emitted habits_updated after timer log.")
+                window_index = len(self.active_timer_windows) # Index for positioning (0-based)
+                self.show_and_position_timer_window(new_timer, window_index)
+                num_added += 1
             else:
-                 QMessageBox.warning(self, "Error", f"Failed to log habit '{activity_name}'.")
+                 print(f"Task '{activity_name}' ({activity_id}) is already running.")
 
-    def check_and_prompt_save_countdown(self, actual_duration, activity_id, activity_name, average_duration_at_start):
-        """Checks if the countdown time significantly differs from the average and prompts to save time entry."""
-        if actual_duration <= 0 or activity_id is None or average_duration_at_start <= 0:
-            return False # Nothing to save or compare
 
-        entry_count = self.db_manager.get_entry_count(activity_id)
+        if num_added > 0:
+             print(f"Started {num_added} new task(s).")
+             if not qtimer_was_running:
+                 self.qtimer.start(1000)
+                 print("Global timer started for UI updates.")
+             self.update_ui_for_selection() # Update button states
+        else:
+             print("No new tasks were started (selected tasks already running or none selected).")
 
-        if entry_count >= COUNTDOWN_MIN_ENTRIES_FOR_SAVE:
-            difference_ratio = abs(actual_duration - average_duration_at_start) / average_duration_at_start
-            if difference_ratio > COUNTDOWN_SAVE_THRESHOLD:
-                percentage_diff = int(difference_ratio * 100)
-                formatted_actual = self.format_time(None, actual_duration)
-                formatted_average = self.format_time(None, average_duration_at_start)
-                direction = 'more' if actual_duration > average_duration_at_start else 'less'
+    def start_selected_countdowns(self):
+        """Starts countdown timers for selected activities if possible."""
+        # Check for conflicts with work timers
+        if any(not task.get('is_countdown', False) for task in self.active_timer_windows.values()):
+            QMessageBox.warning(self, "Timer Busy", "Cannot start countdowns while work tasks are active.")
+            return
+        if len(self.selected_activity_details) == 0:
+            QMessageBox.warning(self, "Error", "Please select at least one activity for countdown.")
+            return
 
-                reply = QMessageBox.question(
-                    self, "Save Time Entry?", # Changed title for clarity
-                    f"Countdown session for '{activity_name}' lasted {formatted_actual}, "
-                    f"which is {percentage_diff}% {direction} than the planned average ({formatted_average}).\n\n"
-                    f"Add this duration ({formatted_actual}) as a new time entry?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-                )
+        qtimer_was_running = self.qtimer.isActive()
+        num_added = 0
+        default_font = self.activity_tree.font()
+        bold_font = QFont(default_font)
+        bold_font.setBold(True)
 
-                if reply == QMessageBox.StandardButton.Yes:
-                    print(f"Saving countdown result as time entry: {actual_duration} sec for ID {activity_id}.")
-                    if self.db_manager.add_time_entry(activity_id, actual_duration):
-                        return True # Successfully saved time entry
-                    else:
-                        QMessageBox.warning(self, "Error", "Failed to save time entry.")
-                        return False # Error saving
-        # Didn't prompt or user declined saving time entry
-        return False
+        for activity_id, activity_name in self.selected_activity_details:
+            if activity_id not in self.active_timer_windows:
+                # Check if average duration exists for this activity
+                average_duration = self.db_manager.calculate_average_duration(activity_id)
+                if average_duration > 0:
+                    target_duration = int(average_duration)
+                    print(f"Starting countdown for: {activity_name} ({activity_id}), Target: {target_duration}s")
+
+                    task_start_time = time.time()
+                    color = self._get_next_multitask_color()
+                    new_timer = TimerWindow(initial_color=color, parent=self)
+
+                    # Connect signals
+                    new_timer.pause_requested.connect(lambda checked=False, aid=activity_id: self.handle_pause_request(aid))
+                    new_timer.resume_requested.connect(lambda checked=False, aid=activity_id: self.handle_resume_request(aid))
+                    new_timer.end_requested.connect(lambda checked=False, aid=activity_id: self.handle_end_request(aid))
+
+                    # Add task data, marking as countdown and storing target
+                    self.active_timer_windows[activity_id] = {
+                        'window': new_timer,
+                        'state': TimerWindow.STATE_TRACKING,
+                        'current_interval_start_time': task_start_time,
+                        'total_session_work_sec': 0,
+                        'total_session_break_sec': 0,
+                        'session_id': task_start_time,
+                        'activity_name': activity_name,
+                        'is_countdown': True, # Mark as countdown
+                        'target_duration': target_duration # Store target duration
+                    }
+                    # Initial display shows target time
+                    new_timer.showTrackingState(self.format_time(None, target_duration), "00:00:00", activity_name)
+                    new_timer.set_overrun(False)
+
+                    item_ref = self._find_tree_item_by_id(activity_id)
+                    if item_ref:
+                        item_ref.setFont(0, bold_font)
+
+                    window_index = len(self.active_timer_windows) # Index for positioning
+                    self.show_and_position_timer_window(new_timer, window_index)
+                    num_added += 1
+                else:
+                    print(f"Skipping countdown for '{activity_name}' ({activity_id}): No average time data.")
+            else:
+                print(f"Countdown or task for '{activity_name}' ({activity_id}) is already running.")
+
+        if num_added > 0:
+            print(f"Started {num_added} new countdown timer(s).")
+            if not qtimer_was_running:
+                self.qtimer.start(1000)
+                print("Global timer started for UI updates.")
+            self.update_ui_for_selection() # Update button states
+        else:
+            print("No new countdowns were started.")
+
+    def start_countdown_timer(self, activity_id, activity_name, average_duration):
+        """Internal logic to start the countdown state and timer window."""
+        # <<< MODIFICATION: Extracted from old toggle_countdown/start_countdown_timer >>>
+        print(f"Starting 'Countdown' session for: {activity_name} ({activity_id}) from {average_duration:.0f} sec.")
+        session_start_time = time.time()
+        # No global session ID needed, but we store countdown specific state
+        self.countdown_activity_id = activity_id
+        self.countdown_target_duration = int(average_duration)
+        # Reset multi-task color index if needed, or let it continue
+        # self._multitask_color_index = 0
+
+        # Ensure global timer is running
+        if not self.qtimer.isActive():
+             self.qtimer.start(1000)
+             print("Global timer started for countdown.")
+
+        color = self._get_next_multitask_color()
+        countdown_window = TimerWindow(initial_color=color, parent=self)
+
+        # Add to active_timer_windows so updates happen, but use countdown state
+        self.active_timer_windows[activity_id] = {
+            'window': countdown_window,
+            'state': TimerWindow.STATE_TRACKING, # Countdown runs in tracking state
+            'current_interval_start_time': session_start_time,
+            'total_session_work_sec': 0, 'total_session_break_sec': 0,
+             # Use start time as session ID for DB logging
+            'session_id': session_start_time,
+            'activity_name': activity_name
+            # Add a flag? 'is_countdown': True (optional, could check self.countdown_activity_id)
+        }
+
+        countdown_window.pause_requested.connect(lambda checked=False, aid=activity_id: self.handle_pause_request(aid))
+        countdown_window.resume_requested.connect(lambda checked=False, aid=activity_id: self.handle_resume_request(aid))
+        countdown_window.end_requested.connect(lambda checked=False, aid=activity_id: self.handle_end_request(aid))
+
+        # Initial display shows target time
+        countdown_window.showTrackingState(self.format_time(None, self.countdown_target_duration), "00:00:00", activity_name)
+        countdown_window.set_overrun(False)
+
+        item_ref = self._find_tree_item_by_id(activity_id)
+        if item_ref:
+            bold_font = QFont(self.activity_tree.font())
+            bold_font.setBold(True)
+            item_ref.setFont(0, bold_font)
+
+        self.show_and_position_timer_window(countdown_window, 0) # Show countdown window first
+        self.update_ui_for_selection() # Update buttons (disables start tasks, changes countdown button)
+
+
+    # --- Pause/Resume/End Handlers ---
+    # (handle_pause_request, handle_resume_request remain largely the same)
+
+    def handle_pause_request(self, activity_id):
+        print(f"DEBUG: Pause requested for {activity_id}") # Keep this
+        if activity_id in self.active_timer_windows:
+            task_data = self.active_timer_windows[activity_id]
+            if task_data['state'] == TimerWindow.STATE_TRACKING:
+                now = time.time()
+                work_duration = now - task_data['current_interval_start_time']
+                # <<< ADD THIS PRINT >>>
+                print(f"DEBUG: Calculated work_duration before save: {work_duration:.4f}s for {activity_id}")
+                task_data['total_session_work_sec'] += work_duration
+
+                if work_duration >= 1:
+                    # <<< ADD THIS PRINT >>>
+                    print(f"DEBUG: work_duration >= 1, attempting to call add_time_entry...")
+                    # Use the task's specific session_id
+                    success = self.db_manager.add_time_entry(activity_id, int(work_duration),
+                                                   entry_type='work', session_id=task_data['session_id'])
+                    # <<< ADD THIS PRINT >>>
+                    print(f"DEBUG: add_time_entry for 'work' returned: {success}")
+                else:
+                    # <<< ADD THIS PRINT >>>
+                    print(f"DEBUG: work_duration < 1, skipped add_time_entry.")
+
+                task_data['state'] = TimerWindow.STATE_PAUSED
+                task_data['current_interval_start_time'] = now # Start break time
+                # ... (rest of UI update)
+                task_data['window'].showPausedState(
+                    self.format_time(None, 0),
+                    self.format_time(None, task_data['total_session_break_sec']),
+                    task_data['activity_name'])
+            else: print(f"-- Task {activity_id} already paused.")
+        else: print(f"-- Task {activity_id} not found for pause request.")
+
+    def handle_resume_request(self, activity_id):
+        print(f"DEBUG: Resume requested for {activity_id}") # Existing debug print
+        if activity_id in self.active_timer_windows:
+            task_data = self.active_timer_windows[activity_id]
+            if task_data['state'] == TimerWindow.STATE_PAUSED:
+                now = time.time()
+                break_duration = now - task_data['current_interval_start_time']
+
+                # <<< ADDED THIS PRINT (Step 1) >>>
+                print(f"DEBUG: Calculated break_duration before save: {break_duration:.4f}s for {activity_id}")
+
+                task_data['total_session_break_sec'] += break_duration
+                print(f"-- Resuming {activity_id}. Break interval: {break_duration:.0f}s. Total break: {task_data['total_session_break_sec']:.0f}s") # Existing info print
+
+                # Check duration and attempt to save the break entry
+                if break_duration >= 1:
+                    # <<< ADDED THIS PRINT (Step 1) >>>
+                    print(f"DEBUG: break_duration >= 1, attempting to call add_time_entry...")
+                    # Use the task's specific session_id stored in task_data
+                    success = self.db_manager.add_time_entry(activity_id, int(break_duration),
+                                                   entry_type='break', session_id=task_data['session_id'])
+                    # <<< ADDED THIS PRINT (Step 1) >>>
+                    print(f"DEBUG: add_time_entry for 'break' returned: {success}")
+                else:
+                    # <<< ADDED THIS PRINT (Step 1) >>>
+                    print(f"DEBUG: break_duration < 1, skipped add_time_entry.")
+
+                # Update task state
+                task_data['state'] = TimerWindow.STATE_TRACKING
+                task_data['current_interval_start_time'] = now # Start new work interval
+
+                # Reset display based on whether it's countdown or normal work
+                # <<< USING CORRECTED LOGIC (Step 2 - from multi-countdown changes) >>>
+                if task_data.get('is_countdown', False):
+                    target_duration = task_data.get('target_duration', 0)
+                    # Use accumulated work time to accurately calculate remaining time after pause
+                    total_elapsed_session = task_data['total_session_work_sec']
+                    remaining = target_duration - total_elapsed_session
+                    display_text_main = self.format_time(None, max(0, remaining)) # Show remaining or 00:00:00
+                    # Update the timer window display
+                    task_data['window'].showTrackingState(display_text_main, self.format_time(None, total_elapsed_session), task_data['activity_name'])
+                    # Set the correct overrun state
+                    task_data['window'].set_overrun(remaining < 0, abs(remaining) if remaining < 0 else 0)
+                else: # Normal work timer
+                    task_data['window'].showTrackingState(
+                        self.format_time(None, 0), # Current interval starts now
+                        self.format_time(None, task_data['total_session_work_sec']),
+                        task_data['activity_name'])
+                    # Ensure overrun is off for work timers
+                    task_data['window'].set_overrun(False)
+
+            else:
+                print(f"-- Task {activity_id} not paused.")
+        else:
+            print(f"-- Task {activity_id} not found for resume request.")
+
+    def handle_end_request(self, activity_id):
+        """Handles the 'End' button click from a TimerWindow."""
+        print(f"End requested for {activity_id} via window button.")
+        # Usually, we want to save the last interval when ending via the window button
+        self.stop_single_task(activity_id, save_entry=True)
 
     def update_timer(self):
-        """Updates the time display in the timer window."""
-        if self.start_time is None or self.timer_type is None:
-            self.qtimer.stop() # Stop timer if state is inconsistent
+        """Updates all active timer windows based on their state (work or countdown)."""
+        # <<< MODIFICATION: Uses task_data flags to determine update logic >>>
+        if not self.qtimer.isActive(): return
+
+        if not self.active_timer_windows:
+            print("Update timer called with no active windows. Stopping timer.")
+            self.qtimer.stop()
+            self.update_ui_for_selection()
             return
 
-        elapsed = time.time() - self.start_time
+        current_time = time.time()
+        active_ids = list(self.active_timer_windows.keys())
 
-        if self.timer_type == 'work':
-            self.timer_window.setText(self.format_time(None, elapsed))
-            if self.timer_window.is_overrun:
-                 self.timer_window.set_overrun(False)
+        for activity_id in active_ids:
+            if activity_id not in self.active_timer_windows: continue
 
-        elif self.timer_type == 'countdown':
-            remaining = self.countdown_average_duration - elapsed
-            if remaining < 0:
-                # Time's up, show overrun
-                overrun_seconds = abs(remaining)
-                self.timer_window.set_overrun(True, overrun_seconds)
-                self.timer_window.setText(f"-{self.format_time(None, overrun_seconds)}")
-            else:
-                # Time still counting down
-                self.timer_window.set_overrun(False)
-                self.timer_window.setText(self.format_time(None, remaining))
+            task_data = self.active_timer_windows[activity_id]
+            window = task_data['window']
 
+            if task_data['state'] == TimerWindow.STATE_TRACKING:
+                # Common calculation for elapsed time in current interval and total session
+                current_interval_sec = current_time - task_data['current_interval_start_time']
+                # Use total_session_work_sec for accumulated time in tracking state
+                total_session_sec = task_data['total_session_work_sec'] + current_interval_sec
+
+                # Check if this task is a countdown
+                if task_data.get('is_countdown', False):
+                    target_duration = task_data.get('target_duration', 0)
+                    remaining = target_duration - total_session_sec
+                    if remaining < 0:
+                        overrun_seconds = abs(remaining)
+                        window.set_overrun(True, overrun_seconds)
+                        display_text_main = f"-{self.format_time(None, overrun_seconds)}"
+                    else:
+                        window.set_overrun(False)
+                        display_text_main = self.format_time(None, remaining)
+                    # Info label shows total elapsed work/session time
+                    window.showTrackingState(display_text_main, self.format_time(None, total_session_sec), task_data['activity_name'])
+                else: # It's a normal work timer
+                    window.set_overrun(False)
+                    display_text_main = self.format_time(None, current_interval_sec)
+                    total_session_str = self.format_time(None, total_session_sec)
+                    # Info label shows total work time
+                    window.showTrackingState(display_text_main, total_session_str, task_data['activity_name'])
+
+            elif task_data['state'] == TimerWindow.STATE_PAUSED:
+                # Update pause display (same for both work and countdown)
+                current_break_interval_sec = current_time - task_data['current_interval_start_time']
+                total_break_sec = task_data['total_session_break_sec'] + current_break_interval_sec
+                current_break_str = self.format_time(None, current_break_interval_sec)
+                total_break_str = self.format_time(None, total_break_sec)
+                window.showPausedState(current_break_str, total_break_str, task_data['activity_name'])
+
+
+    def stop_all_tasks(self):
+        """Stops all active timers (work and countdown), saving last intervals."""
+        # <<< MODIFICATION: Simplified, removes global countdown reset >>>
+        if not self.active_timer_windows:
+            print("stop_all_tasks called but no active session.")
+            return
+
+        num_active = len(self.active_timer_windows)
+        print(f"Stopping {num_active} active task(s) via stop_all_tasks.")
+        ids_to_stop = list(self.active_timer_windows.keys())
+
+        for activity_id in ids_to_stop:
+            self.stop_single_task(activity_id, save_entry=True) # Save by default
+
+        # Explicit cleanup (stop_single_task removes from dict)
+        self.active_timer_windows = {} # Should be empty now
+        self._multitask_color_index = 0
+
+        if self.qtimer.isActive():
+            self.qtimer.stop()
+            print("Global timer stopped.")
+
+        # Ensure UI reflects the stopped state
+        self.update_ui_for_selection()
+
+# --- Paste this entire method into your MainWindow class, replacing the existing one ---
+
+    def stop_single_task(self, activity_id, save_entry=True):
+        """Stops one task, saves last interval if requested, updates global state if last task."""
+        print(f"DEBUG: Attempting to stop/end task ID: {activity_id}. Save last: {save_entry}") # Existing debug print
+
+        if activity_id not in self.active_timer_windows:
+            print(f"-- Task {activity_id} not found (already stopped?).")
+            # Safety check: If no windows left, ensure timer is stopped and UI updated.
+            if not self.active_timer_windows and self.qtimer.isActive():
+                 print("-- No active windows left, stopping qtimer.")
+                 self.qtimer.stop()
+                 self.update_ui_for_selection() # Update UI just in case
+            return
+
+        # Remove task data from the active dictionary
+        task_data = self.active_timer_windows.pop(activity_id)
+        window = task_data['window']
+        activity_name = task_data['activity_name']
+        session_id = task_data['session_id'] # <<< Use the specific session ID for this task
+        last_work_interval_duration_for_prompt = 0
+
+        # Save the final interval if requested
+        if save_entry:
+            now = time.time()
+            last_duration = now - task_data['current_interval_start_time']
+            entry_type = 'unknown'
+
+            # <<< ADDED THIS PRINT (Step 1 - from previous debug request) >>>
+            print(f"DEBUG: Calculated last_duration before save in stop_single_task: {last_duration:.4f}s for {activity_id}")
+
+            if task_data['state'] == TimerWindow.STATE_TRACKING:
+                entry_type = 'work'
+                # Store duration if it was a work interval, for potential habit prompt use
+                last_work_interval_duration_for_prompt = int(last_duration)
+
+                # <<< MODIFIED CHECK AND ADD LOGGING (Step 1) >>>
+                if last_duration >= 1:
+                    print(f"DEBUG: last_duration ('work') >= 1, attempting to call add_time_entry...")
+                    success = self.db_manager.add_time_entry(activity_id, int(last_duration), entry_type=entry_type, session_id=session_id)
+                    print(f"DEBUG: add_time_entry for final 'work' returned: {success}")
+                else:
+                    print(f"DEBUG: last_duration ('work') < 1, skipped add_time_entry.")
+
+            elif task_data['state'] == TimerWindow.STATE_PAUSED:
+                entry_type = 'break'
+                # Break duration isn't typically used for habit prompts
+                last_work_interval_duration_for_prompt = 0
+
+                 # <<< MODIFIED CHECK AND ADD LOGGING (Step 1) >>>
+                if last_duration >= 1:
+                    print(f"DEBUG: last_duration ('break') >= 1, attempting to call add_time_entry...")
+                    success = self.db_manager.add_time_entry(activity_id, int(last_duration), entry_type=entry_type, session_id=session_id)
+                    print(f"DEBUG: add_time_entry for final 'break' returned: {success}")
+                else:
+                     print(f"DEBUG: last_duration ('break') < 1, skipped add_time_entry.")
+        else:
+            # This path taken if save_entry is False (e.g., deleting an activity)
+            print(f"-- Ending task '{activity_name}' without saving last interval.")
+
+        # --- Habit Prompt Logic ---
+        # (Remains the same - decide if you want different logic for countdowns vs work)
+        if save_entry: # Only prompt if the entry was meant to be saved
+            habit_config = self.db_manager.get_activity_habit_config(activity_id)
+            habit_type = habit_config[0] if habit_config else None
+            if habit_type is not None and habit_type != HABIT_TYPE_NONE:
+                print(f"-- Checking habit prompt for task {activity_id} ('{activity_name}')")
+                # Pass the duration of the *last work interval* (0 if stopped during pause)
+                self.prompt_and_log_habit_after_timer(activity_id, activity_name, habit_config, last_work_interval_duration_for_prompt)
+
+        # --- Clean up UI for this specific task ---
+        window.close()
+        item_ref = self._find_tree_item_by_id(activity_id)
+        if item_ref:
+            # Restore default font
+            item_ref.setFont(0, self.activity_tree.font())
+
+        # --- Check if this was the LAST active timer ---
+        # <<< REMOVED: Specific check/reset for self.countdown_activity_id >>>
+        if not self.active_timer_windows: # Dictionary is now empty
+            print("-- All active timers stopped.")
+            if self.qtimer.isActive():
+                self.qtimer.stop()
+                print("Global timer stopped.")
+            self._multitask_color_index = 0 # Reset color index for next session
+            # Update UI fully for the idle state
+            self.update_ui_for_selection()
+        else:
+            # Other timers are still running. Update UI potentially.
+             self.update_ui_for_selection() # Refresh button states based on remaining timers
     @staticmethod
     def format_time(instance_or_none, total_seconds):
-        """Formats seconds into HH:MM:SS. Static method."""
+        """Formats seconds into HH:MM:SS."""
         total_seconds = abs(int(total_seconds))
         h, rem = divmod(total_seconds, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02}"
 
-    def set_controls_enabled(self, enabled):
-        """Enables or disables controls when timer is active/inactive."""
-        self.activity_tree.setEnabled(enabled)
-        # Habit config menu item is handled by activity tree context menu logic
+    # <<< REMOVED: set_controls_enabled method - logic moved to update_ui_for_selection >>>
+    # <<< REMOVED: update_main_stop_button_text method >>>
 
-        # Enable standard management buttons if controls are generally enabled
-        if self.snapshot_button:
-             self.snapshot_button.setEnabled(enabled)
-        if self.habit_tracker_button:
-             self.habit_tracker_button.setEnabled(enabled)
-
-        # Timer buttons and manage entries depend on activity selection,
-        # their state will be updated by activity_selected() when enabled=True
-        if enabled:
-            # Call activity_selected to correctly update buttons and status bar
-            current = self.activity_tree.currentItem()
-            self.activity_selected(current) # Pass current selection
-        else:
-            # When timer is active (enabled=False)
-            # The Start/Stop button must always be enabled to allow stopping
-            self.work_timer_button.setEnabled(True)
-            # The "Start Countdown" button is disabled while another timer runs
-            self.countdown_timer_button.setEnabled(False)
-            # The "Manage Entries" button is disabled
-            if self.manage_entries_button:
-                self.manage_entries_button.setEnabled(False)
-
-
-    def show_and_position_timer_window(self):
-        """Shows and positions the timer window in the corner of the screen."""
-        self.timer_window.show()
+    def show_and_position_timer_window(self, timer_window: TimerWindow, window_index: int):
+        """Shows and positions a new timer window."""
+        # (This method remains the same)
+        timer_window.show()
         try:
-            screen = QApplication.primaryScreen()
-            if screen:
-                sg = screen.availableGeometry()
-                tw = self.timer_window.width()
-                th = self.timer_window.height()
-                margin = 20 # Margin from edge
-                # Position top-right
-                self.timer_window.move(QPoint(sg.right() - tw - margin, sg.top() + margin))
-            else:
-                print("Failed to get primary screen for timer positioning.")
-        except Exception as e:
-            print(f"Error positioning timer window: {e}")
+            screen = QApplication.primaryScreen(); sg = screen.availableGeometry()
+            tw = timer_window.width(); th = timer_window.height()
+            margin = 15; spacing = 5; offset_x = margin
+            # Position based on index (simple tiling)
+            offset_y = margin + window_index * (th + spacing)
+            x = sg.right() - tw - offset_x; y = sg.top() + offset_y
+            # Prevent going off-screen vertically
+            max_y = sg.bottom() - th - margin
+            if y > max_y : y = max_y # Adjust last window if needed
+            timer_window.move(QPoint(x, y))
+        except Exception as e: print(f"Error positioning timer window: {e}")
 
     def closeEvent(self, event):
-        """Handler for the main window close event."""
-        if self.qtimer.isActive(): # Проверяем ОСНОВНОЙ таймер работы/обратного отсчета
-            reply = QMessageBox.question(
-                self, "Timer Active",
-                "The timer is still running. Stop the timer and exit?\n"
-                "(Current progress might be saved or prompted for saving)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
-            )
+        """Handles the main window close event."""
+        # <<< MODIFICATION: Check active_timer_windows OR countdown state >>>
+        if self.active_timer_windows: # Just check if the dictionary is non-empty
+            num_active = len(self.active_timer_windows)
+            # Determine description based on content
+            has_work = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
+            has_countdown = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
+            if has_work and has_countdown: active_desc = f"{num_active} work/countdown timer(s)"
+            elif has_work: active_desc = f"{num_active} work timer(s)"
+            elif has_countdown: active_desc = f"{num_active} countdown timer(s)"
+            else: active_desc = f"{num_active} timer(s)" # Fallback
+
+            reply = QMessageBox.question(self, "Timers Active",
+                                         f"{active_desc} are still running. Stop all and exit?\n(Last intervals will be saved)",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                self.stop_timer_logic() # Останавливаем основной таймер
+                self.stop_all_tasks()
             else:
-                event.ignore() # Отменяем закрытие окна
+                event.ignore()
                 return
 
-        # --- Close main application resources ---
+        print("Closing application resources...")
         self.db_manager.close()
-        self.timer_window.close() # Закрываем маленькое окно таймера
-        # --- Убедитесь, что здесь НЕТ self.flash_timer.stop() или self.grid_animation_timer.stop() ---
+        # Ensure all timer windows are closed explicitly (stop_all_tasks should handle this, but belt-and-suspenders)
+        for task_data in list(self.active_timer_windows.values()):
+             try: task_data['window'].close()
+             except Exception as e: print(f"Error closing timer window during shutdown: {e}")
+        self.active_timer_windows = {}
         print("Application closing.")
-        event.accept() # Разрешаем закрытие окна
-        
+        event.accept()
+
+    # --- Context Menu Methods (add_activity_action, rename_activity_action, configure_habit_action, delete_activity_action) ---
+    # (These remain the same as in the previous version, ensure delete_activity_action calls stop_single_task if deleting a timed activity)
+    def show_activity_context_menu(self, position):
+         # (No changes needed here from previous version)
+         menu = QMenu(self)
+         selected_item = self.activity_tree.currentItem()
+         selected_id = selected_item.data(0, Qt.ItemDataRole.UserRole) if selected_item else None
+
+         add_top_level_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), "Add Top-Level Activity", self)
+         add_top_level_action.triggered.connect(lambda: self.add_activity_action(parent_id=None))
+         menu.addAction(add_top_level_action)
+
+         if selected_item:
+             menu.addSeparator()
+             item_text = selected_item.text(0)
+             # ... (rest of the context menu actions: Add Sub, Rename, Configure, Delete) ...
+             add_sub_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), f"Add Sub-Activity to '{item_text}'", self)
+             add_sub_action.triggered.connect(lambda sid=selected_id: self.add_activity_action(parent_id=sid))
+             menu.addAction(add_sub_action)
+             menu.addSeparator()
+             rename_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "Rename", self)
+             rename_action.triggered.connect(self.rename_activity_action)
+             menu.addAction(rename_action)
+             config_habit_action = QAction(QIcon.fromTheme("preferences-system", QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)), "Configure as Habit...", self)
+             config_habit_action.triggered.connect(self.configure_habit_action)
+             menu.addAction(config_habit_action)
+             menu.addSeparator()
+             delete_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon), "Delete", self)
+             delete_action.triggered.connect(self.delete_activity_action)
+             menu.addAction(delete_action)
+
+         menu.exec(self.activity_tree.viewport().mapToGlobal(position))
+
+    def add_activity_action(self, parent_id=None):
+        # (No changes needed here from previous version)
+        parent_name_suffix = ""
+        if parent_id:
+             item = self._find_tree_item_by_id(parent_id)
+             if item: parent_name_suffix = f" under '{item.text(0)}'"
+        text, ok = QInputDialog.getText(self, "Add Activity", f"Enter name for the new activity{parent_name_suffix}:")
+        if ok and text.strip():
+             new_activity_id = self.db_manager.add_activity(text.strip(), parent_id)
+             if new_activity_id is not None:
+                 self.load_activities() # Reloads tree and updates UI via selection change
+                 new_item = self._find_tree_item_by_id(new_activity_id)
+                 if new_item:
+                     self.activity_tree.setCurrentItem(new_item)
+                     # handle_selection_change is called automatically by setCurrentItem if selection actually changes
+                     # Force UI update just in case selection didn't strictly "change" but content did
+                     self.update_ui_for_selection()
+                 self.habits_updated.emit() # Notify habit views
+        elif ok: QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
+
+
+    def rename_activity_action(self):
+        # (No changes needed here from previous version)
+        selected_item = self.activity_tree.currentItem()
+        if not selected_item: return
+
+        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
+        current_display_name = selected_item.text(0)
+        current_name = current_display_name.replace("[H] ", "", 1) if current_display_name.startswith("[H] ") else current_display_name
+        db_parent_id = self.db_manager.get_activity_parent_id(activity_id)
+
+        new_name, ok = QInputDialog.getText(self, "Rename Activity", "Enter new name:", QLineEdit.EchoMode.Normal, current_name)
+        new_name_stripped = new_name.strip() if ok else ""
+
+        if ok and new_name_stripped and new_name_stripped != current_name:
+             if self.db_manager.update_activity_name(activity_id, new_name_stripped, db_parent_id):
+                 prefix = "[H] " if current_display_name.startswith("[H] ") else ""
+                 selected_item.setText(0, prefix + new_name_stripped)
+                 # Update name in active timer window if it's running
+                 if activity_id in self.active_timer_windows:
+                     self.active_timer_windows[activity_id]['activity_name'] = new_name_stripped
+                     # Force an update of the timer window display text
+                     # (Need to call showTrackingState/showPausedState - update_timer might not catch the name change immediately)
+                     task_data = self.active_timer_windows[activity_id]
+                     # Simplified update - just call update_timer() which will redraw with new name
+                     # Or force redraw:
+                     # if task_data['state'] == TimerWindow.STATE_TRACKING: ... call showTrackingState ...
+                     # else: ... call showPausedState ...
+
+
+                 # Update selection details and UI
+                 updated_selection_details = []
+                 was_selected = False
+                 for sel_id, sel_name in self.selected_activity_details:
+                     if sel_id == activity_id:
+                         updated_selection_details.append((sel_id, new_name_stripped))
+                         was_selected = True
+                     else:
+                         updated_selection_details.append((sel_id, sel_name))
+                 self.selected_activity_details = updated_selection_details
+                 if was_selected: self.update_ui_for_selection()
+
+                 self.habits_updated.emit() # Notify habit views
+
+        elif ok and not new_name_stripped:
+             QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
+
+    def configure_habit_action(self):
+        # (No changes needed here from previous version)
+        selected_item = self.activity_tree.currentItem()
+        if not selected_item: return
+        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
+        display_name = selected_item.text(0)
+        activity_name = display_name.replace("[H] ", "", 1) if display_name.startswith("[H] ") else display_name
+        current_config = self.db_manager.get_activity_habit_config(activity_id)
+        dialog = ConfigureHabitDialog(activity_id, activity_name, current_config, self.db_manager, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            print(f"Habit config updated for {activity_name}. Reloading activities.")
+            selected_ids_before_reload = {details[0] for details in self.selected_activity_details}
+            self.load_activities() # Reloads tree
+            # Restore selection
+            items_to_select = []
+            iterator = QTreeWidgetItemIterator(self.activity_tree)
+            while iterator.value():
+                item = iterator.value()
+                item_id = item.data(0, Qt.ItemDataRole.UserRole)
+                if item_id in selected_ids_before_reload: items_to_select.append(item)
+                iterator += 1
+            self.activity_tree.blockSignals(True)
+            self.activity_tree.clearSelection()
+            for item in items_to_select: item.setSelected(True)
+            self.activity_tree.blockSignals(False)
+            self.handle_selection_change() # Update UI for restored selection
+
+            self.habits_updated.emit() # Notify habit views
+
+    def delete_activity_action(self):
+        # <<< MODIFICATION: Ensure stop_single_task is called before DB delete >>>
+        selected_item = self.activity_tree.currentItem()
+        if not selected_item: return
+        activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
+        activity_name = selected_item.text(0)
+        base_activity_name = activity_name.replace("[H] ", "", 1) if activity_name.startswith("[H] ") else activity_name
+
+        # Warning message logic (remains the same)
+        warning_message = ""; all_descendants = self.db_manager.get_descendant_activity_ids(activity_id)
+        descendant_count = len(all_descendants) - 1 if activity_id in all_descendants else len(all_descendants)
+        if descendant_count > 0: warning_message += f"\n\nWARNING: Also deletes {descendant_count} child activities!"
+        warning_message += "\nAll associated time/habit entries will also be deleted!"
+        reply = QMessageBox.question(self, "Confirm Deletion", f"Delete '{base_activity_name}'?{warning_message}",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            was_habit, _, _ = self.db_manager.get_activity_habit_config(activity_id)
+            is_habit = was_habit is not None and was_habit != HABIT_TYPE_NONE
+
+            # <<< MODIFICATION: Stop timer *before* deleting from DB >>>
+            if activity_id in self.active_timer_windows or self.countdown_activity_id == activity_id:
+                print(f"Stopping timer for activity being deleted: {activity_id}")
+                # Stop without saving the final interval, as the entry would be deleted anyway
+                self.stop_single_task(activity_id, save_entry=False)
+
+            # Now proceed with deletion
+            if self.db_manager.delete_activity(activity_id):
+                 self.load_activities() # Reload tree (selection is cleared, UI updates)
+                 if is_habit:
+                     self.habits_updated.emit()
+            else:
+                 QMessageBox.critical(self, "Deletion Error", f"Failed to delete activity '{base_activity_name}'.")
+
+    # --- Dialog Openers (open_entry_management, open_daily_snapshot, open_habit_tracker) ---
+    # (No changes needed here from previous version)
+    def open_entry_management(self):
+        if len(self.selected_activity_details) != 1:
+            QMessageBox.warning(self, "Selection Error", "Please select exactly one activity to manage entries.")
+            return
+        activity_id, activity_name = self.selected_activity_details[0]
+        dialog = EntryManagementDialog(activity_id, activity_name, self.db_manager, self)
+        dialog.exec()
+        if dialog.needs_update:
+            print("Updating activity info after managing entries...")
+            self.update_ui_for_selection() # Update status bar stats
+
+    def open_daily_snapshot(self):
+        dialog = DailySnapshotDialog(self.db_manager, self)
+        dialog.exec()
+
+    def open_habit_tracker(self):
+        # Pass self so dialog can connect to habits_updated signal
+        dialog = HabitTrackerDialog(self.db_manager, self)
+        dialog.exec()
+
+    # --- Habit Prompting Methods ---
+    # (prompt_and_log_habit_after_timer, check_and_prompt_save_countdown)
+    # (No changes needed here from previous version)
+    def prompt_and_log_habit_after_timer(self, activity_id, activity_name, habit_config, work_duration_seconds):
+        # (Code remains the same)
+        habit_type, habit_unit, _ = habit_config # Goal not needed here
+        today_str = QDate.currentDate().toString("yyyy-MM-dd")
+        # Check if log already exists for today? Optional optimization.
+        reply = QMessageBox.question(self, "Log Habit?", f"Activity '{activity_name}' is also a habit.\nLog completion for {today_str}?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes: return
+
+        new_value = None; ok_to_log = False
+        # ... (Rest of the logic for Binary, Percentage, Numeric prompts) ...
+        if habit_type == HABIT_TYPE_BINARY:
+            bin_reply = QMessageBox.question(self, "Confirm Habit", f"Mark habit '{activity_name}' as DONE for today?",
+                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes)
+            if bin_reply == QMessageBox.StandardButton.Yes: new_value = 1.0; ok_to_log = True
+        elif habit_type == HABIT_TYPE_PERCENTAGE:
+            # ... (Percentage dialog logic) ...
+             percent_dialog = QDialog(self); percent_dialog.setWindowTitle(f"Log Percentage: {activity_name}")
+             p_layout = QVBoxLayout(percent_dialog); p_layout.addWidget(QLabel(f"How much of '{activity_name}' did you complete today?"))
+             btn_layout = QHBoxLayout(); result = {'value': None}
+             percentages = [25.0, 50.0, 75.0, 100.0]
+             for p in percentages:
+                 button = QPushButton(f"{p:g}%")
+                 button.clicked.connect(lambda checked=False, pct=p: (result.update({'value': pct}), percent_dialog.accept()))
+                 btn_layout.addWidget(button)
+             p_layout.addLayout(btn_layout); cancel_button = QPushButton("Cancel"); cancel_button.clicked.connect(percent_dialog.reject)
+             p_layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignRight)
+             if percent_dialog.exec() == QDialog.DialogCode.Accepted and result['value'] is not None:
+                 new_value = result['value']; ok_to_log = True
+        elif habit_type == HABIT_TYPE_NUMERIC:
+            # ... (Numeric input dialog logic with auto-fill) ...
+            prompt_text = f"Enter value for '{activity_name}'"; default_value = 0.0
+            if habit_unit: prompt_text += f" ({habit_unit})"
+            prompt_text += f" for {today_str}:"
+            if habit_unit and habit_unit.lower() in ['minutes', 'min', 'm']: default_value = round(work_duration_seconds / 60.0, 2)
+            elif habit_unit and habit_unit.lower() in ['hours', 'hrs', 'h']: default_value = round(work_duration_seconds / 3600.0, 2)
+            elif habit_unit and habit_unit.lower() in ['seconds', 'sec', 's']: default_value = float(work_duration_seconds)
+
+            num_value, ok = QInputDialog.getDouble(self, "Log Numeric Habit", prompt_text, value=default_value, min=-999999.0, max=999999.0, decimals=2)
+            # Add clarification for clearing/logging zero?
+            if ok:
+                 # Ask to clarify if 0 means "clear" or "log zero"
+                 if num_value == 0.0:
+                     reply_zero = QMessageBox.question(self, "Confirm Zero",
+                                                 f"Log value '0' for '{activity_name}' or clear the entry for this date?",
+                                                 buttons=QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.No, # Rename No->Clear
+                                                 defaultButton=QMessageBox.StandardButton.Cancel)
+                     if reply_zero == QMessageBox.StandardButton.Save: # Log Zero
+                         new_value = 0.0
+                         ok_to_log = True
+                     elif reply_zero == QMessageBox.StandardButton.No: # Clear (Set None)
+                         new_value = None
+                         ok_to_log = True
+                     # else Cancelled, ok_to_log remains False
+                 else: # Non-zero value entered
+                     new_value = num_value
+                     ok_to_log = True
+
+
+        if ok_to_log:
+            if self.db_manager.log_habit(activity_id, today_str, new_value):
+                QMessageBox.information(self, "Habit Logged", f"Habit '{activity_name}' logged for today.")
+                self.habits_updated.emit() # Update habit views
+            else: QMessageBox.warning(self, "Error", f"Failed to log habit '{activity_name}'.")
+
+    def check_and_prompt_save_countdown(self, actual_duration, activity_id, activity_name, average_duration_at_start):
+        # (This method is likely not needed with the current save logic but kept for reference)
+        # ...
+        return True # Assume save is always desired for now
+
+
+# --- End of Modified MainWindow Class ---
+
+# Make sure the rest of the classes (DatabaseManager, HeatmapWidget, TimerWindow, Dialogs, Delegate, Model)
+# and the __main__ block remain as they were in the original code provided.
+# Only the MainWindow class needs to be replaced with the version above.
+
+# =============================================================
+# (Keep all other classes like DatabaseManager, HeatmapWidget, TimerWindow,
+#  EntryManagementDialog, DailySnapshotDialog, ConfigureHabitDialog,
+#  HabitCellDelegate, HabitTableModel, HabitTrackerDialog exactly as they were)
+# =============================================================
+
+# --- Application Launch ---
+if __name__ == '__main__':
+    # Improve rendering on HiDPI displays (optional)
+    if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+
+    app = QApplication(sys.argv)
+    main_win = MainWindow()
+    main_win.show()
+    sys.exit(app.exec())
+
+# --- End of Modified MainWindow Class ---
+
+# (Rest of the code: DatabaseManager, other Widgets, Dialogs, Model, Delegate, __main__ remains the same)
+
+# ... (Keep all other classes as they were) ...
+
+# --- Application Launch ---
+if __name__ == '__main__':
+    # ... (High DPI settings) ...
+    app = QApplication(sys.argv)
+    main_win = MainWindow()
+    main_win.show()
+    sys.exit(app.exec())
 # --- Application Launch ---
 if __name__ == '__main__':
     # Improve rendering on HiDPI displays (optional)
