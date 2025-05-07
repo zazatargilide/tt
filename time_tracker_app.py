@@ -1,4 +1,5 @@
 import sys
+from functools import partial
 import uuid
 import sqlite3
 import time
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QFormLayout
 )
 from PyQt6.QtCore import (Qt, QRect, QSize, QPointF, QTimer, QAbstractTableModel, QModelIndex, QDate, QVariant,
-pyqtSignal, QTimer, QRectF, QPoint, QDateTime, QLocale
+pyqtSignal, QTimer, QRectF, QEvent, QPoint, QDateTime, QLocale
 )
 from PyQt6.QtGui import QPainter, QPainterPath, QFontMetrics, QColor, QBrush, QPen, QFont, QPalette, QLinearGradient, QAction , QIcon
 # --- Constants ---
@@ -57,6 +58,52 @@ class DatabaseManager:
             print(f"Database connection error: {e}")
             self.conn = None
             self.cursor = None
+
+    def calculate_average_session_times(self, activity_id):
+        """
+        Calculates average work, break, and total time per session for an activity.
+        A session is defined by having the same session_id.
+        Returns a tuple: (avg_work_seconds, avg_break_seconds, avg_total_seconds)
+        Returns (0, 0, 0) if no sessions with session_id are found.
+        """
+        if not self.conn or not activity_id:
+            return (0, 0, 0)
+
+        # Используем Common Table Expression (CTE) для удобства
+        query = """
+        WITH SessionDurations AS (
+            SELECT
+                session_id, -- Группируем по ID сессии
+                SUM(CASE WHEN entry_type = 'work' THEN duration_seconds ELSE 0 END) as work_duration, -- Суммируем 'work' в рамках сессии
+                SUM(CASE WHEN entry_type = 'break' THEN duration_seconds ELSE 0 END) as break_duration -- Суммируем 'break' в рамках сессии
+            FROM time_entries
+            WHERE activity_id = ? AND session_id IS NOT NULL -- Учитываем только записи с session_id для нужной активности
+            GROUP BY session_id -- Группируем по сессиям
+            HAVING work_duration > 0 OR break_duration > 0 -- Исключаем сессии с нулевой длительностью (если такие есть)
+        )
+        -- Считаем среднее по всем найденным сессиям
+        SELECT
+            AVG(work_duration),
+            AVG(break_duration),
+            AVG(work_duration + break_duration) -- Среднее общее время сессии
+        FROM SessionDurations;
+        """
+        try:
+            self.cursor.execute(query, (activity_id,))
+            result = self.cursor.fetchone()
+            # AVG вернет None, если в SessionDurations не было строк, или если все значения были NULL
+            if result and result[0] is not None: # Проверяем, что AVG вернул не NULL (хотя бы одна сессия была)
+                # Заменяем возможный None (если были только 'break' или только 'work' сессии) на 0
+                avg_work = result[0] or 0
+                avg_break = result[1] or 0
+                avg_total = result[2] or 0
+                return (avg_work, avg_break, avg_total)
+            else:
+                # Не найдено сессий с session_id или все сессии были нулевой длины
+                return (0, 0, 0)
+        except sqlite3.Error as e:
+            print(f"Error calculating average session times for activity {activity_id}: {e}")
+            return (0, 0, 0)
 
     def _add_column_if_not_exists(self, table_name, column_name, column_def):
         """Helper to add a column if it doesn't exist."""
@@ -201,26 +248,70 @@ class DatabaseManager:
 
     def add_activity(self, name, parent_id=None):
         """Adds an activity, optionally specifying a parent."""
-        if not self.conn or not name: return None
-        name = name.strip()
-        if not name: return None
-
-        if self._check_activity_name_exists(name, parent_id):
-             print(f"Activity '{name}' already exists with the same parent (parent_id: {parent_id}).")
-             QMessageBox.warning(None, "Duplicate", f"An activity named '{name}' already exists in this branch.")
-             return None
-
-        try:
-            # Insert with default NULL for habit columns
-            self.cursor.execute("INSERT INTO activities (name, parent_id) VALUES (?, ?)", (name, parent_id))
-            self.conn.commit()
-            new_id = self.cursor.lastrowid
-            print(f"Activity '{name}' (ID: {new_id}, parent_id: {parent_id}) added.")
-            return new_id
-        except sqlite3.Error as e:
-            print(f"Error adding activity: {e}")
+        if not self.conn or not name:
+            print("DB_ADD_ACTIVITY_ERROR: No connection or name provided.")
+            return None
+        name_stripped = name.strip() # Ensure name is stripped before checks and insert
+        if not name_stripped:
+            print("DB_ADD_ACTIVITY_ERROR: Name is empty after stripping.")
             return None
 
+        # Check for duplicate name under the same parent first
+        if self._check_activity_name_exists(name_stripped, parent_id):
+            print(f"DB_ADD_ACTIVITY_WARN: Activity '{name_stripped}' already exists with the same parent (parent_id: {parent_id}).")
+            # QMessageBox is a UI element, ideally not called directly from DB Manager.
+            # This warning should be handled by the caller (MainWindow) if desired.
+            # For now, we just print and return None.
+            # QMessageBox.warning(None, "Duplicate", f"An activity named '{name_stripped}' already exists in this branch.")
+            return None
+
+        try:
+            # --- EXTENDED DEBUGGING ---
+            debug_msg_parts = [
+                f"DB_ADD_ACTIVITY_ATTEMPT: Inserting '{name_stripped}'",
+                f"with parent_id: {parent_id}",
+                f"(type: {type(parent_id)})."
+            ]
+
+            if parent_id is not None:
+                # Explicitly check if the parent_id exists in the activities table
+                self.cursor.execute("SELECT 1 FROM activities WHERE id = ?", (parent_id,))
+                parent_exists_in_db = self.cursor.fetchone()
+                if parent_exists_in_db:
+                    debug_msg_parts.append("Parent ID check: EXISTS in DB.")
+                else:
+                    # This is the most likely cause of FOREIGN KEY constraint failed
+                    debug_msg_parts.append("Parent ID check: DOES NOT EXIST in DB! <<< LIKELY CAUSE OF ERROR")
+            else:
+                debug_msg_parts.append("Parent ID is None (top-level activity).")
+            
+            print(" ".join(debug_msg_parts))
+            # --- END EXTENDED DEBUGGING ---
+
+            self.cursor.execute("INSERT INTO activities (name, parent_id) VALUES (?, ?)", (name_stripped, parent_id))
+            self.conn.commit()
+            new_id = self.cursor.lastrowid
+            print(f"DB_ADD_ACTIVITY_SUCCESS: Activity '{name_stripped}' (ID: {new_id}, parent_id: {parent_id}) added.")
+            return new_id
+        except sqlite3.Error as e:
+            error_message = f"DB_ADD_ACTIVITY_ERROR: Error adding activity '{name_stripped}' with parent_id {parent_id}: {e}"
+            print(error_message)
+            # If it's a foreign key error, let's get more info about existing IDs for context
+            if "FOREIGN KEY constraint failed" in str(e):
+                try:
+                    self.cursor.execute("SELECT id FROM activities ORDER BY id DESC LIMIT 10")
+                    recent_ids = self.cursor.fetchall()
+                    print(f"DB_ADD_ACTIVITY_DEBUG: Recent activity IDs in DB: {recent_ids}")
+                    if parent_id is not None:
+                         self.cursor.execute("SELECT * FROM activities WHERE id = ?", (parent_id,))
+                         parent_row_details = self.cursor.fetchone()
+                         print(f"DB_ADD_ACTIVITY_DEBUG: Details for attempted parent_id {parent_id} in DB: {parent_row_details}")
+
+                except Exception as query_e:
+                    print(f"DB_ADD_ACTIVITY_DEBUG: Could not fetch debug info on error: {query_e}")
+            self.conn.rollback() # Ensure rollback on any error
+            return None
+    
     def get_activities(self):
         """Gets all activities (id, name, parent_id)."""
         if not self.conn: return []
@@ -2600,6 +2691,12 @@ class MainWindow(QMainWindow):
         # --- Activity Tree ---
         main_layout.addWidget(QLabel("Activities (Right-click; Ctrl/Shift to multi-select):"))
         self.activity_tree = QTreeWidget()
+        self.activity_tree.setMouseTracking(True) # Важно для itemEntered
+        self.activity_tree.itemEntered.connect(self.handle_item_entered)
+        # Устанавливаем фильтр событий на область просмотра дерева для отслеживания ухода мыши
+        self.activity_tree.viewport().installEventFilter(self)
+        self.activity_tree.viewport().setMouseTracking(True) # Также нужно для viewport
+        self._hovered_item_id = None # Храним ID элемента под курсором
         self.activity_tree.setColumnCount(1)
         self.activity_tree.setHeaderHidden(True)
         self.activity_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -2707,6 +2804,62 @@ class MainWindow(QMainWindow):
         self._multitask_color_index += 1
         return color
 
+    def handle_item_entered(self, item, column):
+        """Вызывается, когда курсор входит в область элемента дерева."""
+        # Обновляем статус, только если таймеры не активны
+        if not self.active_timer_windows:
+            self.update_status_for_hovered_item(item)
+
+    def update_status_for_hovered_item(self, item):
+        """Обновляет status_label для элемента под курсором или сбрасывает его."""
+        # Если таймеры активны, ничего не делаем (статус показывает таймер)
+        if self.active_timer_windows:
+            # Можно добавить обновление текста, если необходимо, но пока оставим как есть
+            # self.update_ui_for_selection() # Или специфичный текст для активного таймера
+            return
+
+        activity_id = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+
+        # Предотвращаем лишние вызовы, если курсор над тем же элементом
+        if activity_id == self._hovered_item_id:
+            return
+        self._hovered_item_id = activity_id
+
+
+        if item and activity_id is not None:
+            # Получаем средние значения
+            avg_work, avg_break, avg_total = self.db_manager.calculate_average_session_times(activity_id)
+
+            # Форматируем время
+            fmt_total = self.format_time(None, avg_total)
+            fmt_work = self.format_time(None, avg_work)
+            fmt_break = self.format_time(None, avg_break)
+
+            # Формируем строку (используем русский и английский для примера)
+            status_string = f"Average session time: {fmt_total} | Work: {fmt_work} | Break: {fmt_break}"
+            # Или как в вашем запросе:
+            # status_string = f"Среднее время полного завершения дела: {fmt_total}, average actual work time: {fmt_work}, average relax time: {fmt_break}"
+
+            self.status_label.setText(status_string)
+        else:
+            # Курсор не над элементом с ID, восстанавливаем статус по текущему ВЫБОРУ
+            self.update_ui_for_selection() # Этот метод уже устанавливает текст status_label
+
+    def eventFilter(self, source, event):
+        """Фильтр событий для отслеживания ухода мыши из области дерева."""
+        # Проверяем, что событие от нужного виджета и тип события - уход мыши
+        if source is self.activity_tree.viewport() and event.type() == QEvent.Type.Leave:
+            # Мышь покинула область дерева, сбрасываем статус
+            # Проверяем, активны ли таймеры перед сбросом
+            if not self.active_timer_windows:
+                print("DEBUG: Mouse left tree viewport, resetting status.") # Отладка
+                self._hovered_item_id = None # Сбрасываем отслеживаемый ID
+                self.update_status_for_hovered_item(None) # Вызовет update_ui_for_selection
+            return True # Событие обработано
+
+        # Передаем все остальные события дальше
+        return super(MainWindow, self).eventFilter(source, event)
+
     def handle_selection_change(self):
         """Updates the internal list of selected activities and the UI."""
         # <<< MODIFICATION: No longer blocked by active timers >>>
@@ -2720,23 +2873,40 @@ class MainWindow(QMainWindow):
                 self.selected_activity_details.append((item_id, actual_name))
         self.update_ui_for_selection()
 
+# Внутри класса MainWindow:
     def update_ui_for_selection(self):
         """Updates buttons and status bar based on current selection and timer state."""
-        # <<< MODIFICATION: Simplified and adapted for multi-tasking >>>
+        # <<< ДОБАВИТЬ ПРОВЕРКУ >>>
+        # Если таймеры активны, статус бар обновляется в update_timer, не меняем его здесь
+        if self.active_timer_windows:
+            # Только обновляем состояние кнопок
+            num_selected = len(self.selected_activity_details)
+            # ... (только логика enable/disable кнопок, БЕЗ self.status_label.setText) ...
+            work_timers_active = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
+            countdown_timers_active = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
+            self.start_tasks_button.setEnabled(num_selected >= 1 and not countdown_timers_active)
+            has_selection_with_avg = any(self.db_manager.calculate_average_duration(aid) > 0 for aid, _ in self.selected_activity_details)
+            can_start_countdown = num_selected >= 1 and has_selection_with_avg and not work_timers_active
+            self.start_countdowns_button.setEnabled(can_start_countdown)
+            if self.manage_entries_button: self.manage_entries_button.setEnabled(num_selected == 1)
+
+            return # Выходим, не меняя status_label
+
+        # --- Если таймеры НЕ активны, обновляем и статус бар ---
         num_selected = len(self.selected_activity_details)
         is_single_selection = num_selected == 1
         is_any_selection = num_selected >= 1
 
-        # --- Update Status Label ---
-        avg_duration_specific = 0 # Used for countdown check and status text
+        avg_duration_specific = 0 # Используется для статуса и кнопки countdown
         status_text = "Select activity(-ies)"
+
         if is_single_selection:
             single_id, single_name = self.selected_activity_details[0]
             try:
-                # Fetch stats only if needed for status or countdown button state
-                avg_duration_specific = self.db_manager.calculate_average_duration(single_id)
-                total_duration_branch = self.db_manager.calculate_total_duration_for_activity_branch(single_id)
-                avg_text = f"Avg: {self.format_time(None, avg_duration_specific)}" if avg_duration_specific > 0 else "Avg: N/A"
+                # Статистика для выбранного элемента
+                avg_duration_specific = self.db_manager.calculate_average_duration(single_id) # Среднее время записи
+                total_duration_branch = self.db_manager.calculate_total_duration_for_activity_branch(single_id) # Общее время ветки
+                avg_text = f"Avg Entry: {self.format_time(None, avg_duration_specific)}" if avg_duration_specific > 0 else "Avg Entry: N/A"
                 total_text = f"Branch Total: {self.format_time(None, total_duration_branch)}"
                 status_text = f"Selected: {single_name} ({avg_text} | {total_text})"
             except Exception as e:
@@ -2744,73 +2914,21 @@ class MainWindow(QMainWindow):
                 status_text = f"Selected: {single_name} (Error getting stats)"
         elif is_any_selection:
             status_text = f"Selected: {num_selected} activities"
+
+        # <<< УСТАНОВКА СТАТУСА ПО ВЫБОРУ (когда нет hover и нет таймеров) >>>
         self.status_label.setText(status_text)
 
-        # --- Update Button Enable States ---
-        any_timer_active = bool(self.active_timer_windows) or (self.countdown_activity_id is not None)
-
-        # Start Tasks button enabled if anything is selected
+        # --- Обновление состояния кнопок (когда нет таймеров) ---
         self.start_tasks_button.setEnabled(is_any_selection)
-
-        # Countdown button enabled only for single selection with avg time, AND no other timers running
-        can_start_countdown = is_single_selection and avg_duration_specific > 0 and not any_timer_active
-        self.countdown_timer_button.setEnabled(can_start_countdown)
-        # Update countdown button text based on its *own* state
-        if self.countdown_activity_id is not None:
-             self.countdown_timer_button.setText("Stop Countdown")
-             self.countdown_timer_button.setEnabled(True) # Make sure stop is enabled
-        else:
-             self.countdown_timer_button.setText("Start Countdown")
-             # Enable state already set by can_start_countdown
-
-        # Manage Entries enabled only for single selection
-        if self.manage_entries_button:
-            self.manage_entries_button.setEnabled(is_single_selection)
-
-        # Other management buttons are generally always enabled
-        if self.snapshot_button: self.snapshot_button.setEnabled(True)
-        if self.habit_tracker_button: self.habit_tracker_button.setEnabled(True)
-        # Activity tree remains enabled always now
-        self.activity_tree.setEnabled(True)
-
-    def update_ui_for_selection(self):
-        """Updates buttons and status bar based on current selection and timer state."""
-        # <<< MODIFICATION: Updated countdown button logic >>>
-        num_selected = len(self.selected_activity_details)
-        is_single_selection = num_selected == 1
-        is_any_selection = num_selected >= 1
-
-        # --- Update Status Label (No changes needed here) ---
-        avg_duration_specific = 0
-        status_text = "Select activity(-ies)"
-        # ... (logic to calculate stats and set status_text) ...
-        self.status_label.setText(status_text)
-
-        # --- Update Button Enable States ---
-        # Check for different types of active timers
-        any_active_timers = bool(self.active_timer_windows)
-        work_timers_active = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
-        countdown_timers_active = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
-
-        # Start Tasks button enabled if selection exists AND no countdowns are active
-        self.start_tasks_button.setEnabled(is_any_selection and not countdown_timers_active)
-
-        # Start Countdowns button enabled if selection exists (with avg time) AND no work timers are active
-        has_selection_with_avg = any(self.db_manager.calculate_average_duration(aid) > 0 for aid, _ in self.selected_activity_details)
-        can_start_countdown = is_any_selection and has_selection_with_avg and not work_timers_active
+        # Кнопка Countdown зависит от средней *продолжительности записи*, а не сессии
+        can_start_countdown = is_single_selection and avg_duration_specific > 0
         self.start_countdowns_button.setEnabled(can_start_countdown)
-        # Note: Button text for countdowns is now static ("Start Selected Countdown(s)")
 
-        # Manage Entries enabled only for single selection
-        if self.manage_entries_button:
-            self.manage_entries_button.setEnabled(is_single_selection)
-
-        # Other management buttons are generally always enabled
+        if self.manage_entries_button: self.manage_entries_button.setEnabled(is_single_selection)
         if self.snapshot_button: self.snapshot_button.setEnabled(True)
         if self.habit_tracker_button: self.habit_tracker_button.setEnabled(True)
-        # Activity tree remains enabled always
         self.activity_tree.setEnabled(True)
-
+                
     # <<< MODIFICATION: Renamed from toggle_timer >>>
     def start_selected_tasks(self):
         """Starts work timers for selected activities that are not already running."""
@@ -3323,61 +3441,117 @@ class MainWindow(QMainWindow):
     # --- Context Menu Methods (add_activity_action, rename_activity_action, configure_habit_action, delete_activity_action) ---
     # (These remain the same as in the previous version, ensure delete_activity_action calls stop_single_task if deleting a timed activity)
     def show_activity_context_menu(self, position):
-         # (No changes needed here from previous version)
-         menu = QMenu(self)
-         selected_item = self.activity_tree.currentItem()
-         selected_id = selected_item.data(0, Qt.ItemDataRole.UserRole) if selected_item else None
+        clicked_item = self.activity_tree.itemAt(position)
+        menu = QMenu(self)
 
-         add_top_level_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), "Add Top-Level Activity", self)
-         add_top_level_action.triggered.connect(lambda: self.add_activity_action(parent_id=None))
-         menu.addAction(add_top_level_action)
+        selected_id = None
+        item_text_for_menu = "selection"
 
-         if selected_item:
-             menu.addSeparator()
-             item_text = selected_item.text(0)
-             # ... (rest of the context menu actions: Add Sub, Rename, Configure, Delete) ...
-             add_sub_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), f"Add Sub-Activity to '{item_text}'", self)
-             add_sub_action.triggered.connect(lambda sid=selected_id: self.add_activity_action(parent_id=sid))
-             menu.addAction(add_sub_action)
-             menu.addSeparator()
-             rename_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), "Rename", self)
-             rename_action.triggered.connect(self.rename_activity_action)
-             menu.addAction(rename_action)
-             config_habit_action = QAction(QIcon.fromTheme("preferences-system", QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)), "Configure as Habit...", self)
-             config_habit_action.triggered.connect(self.configure_habit_action)
-             menu.addAction(config_habit_action)
-             menu.addSeparator()
-             delete_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon), "Delete", self)
-             delete_action.triggered.connect(self.delete_activity_action)
-             menu.addAction(delete_action)
+        if clicked_item:
+            item_text_for_menu = clicked_item.text(0)
+            retrieved_data = clicked_item.data(0, Qt.ItemDataRole.UserRole)
+            # This first print is what we saw: UI_DEBUG_CONTEXT_MENU: Clicked Item='[H] 14 hwf + кс', Retrieved UserRole Data='6' (type: <class 'int'>)
+            print(f"UI_DEBUG_CONTEXT_MENU: Clicked Item='{item_text_for_menu}', Retrieved UserRole Data='{retrieved_data}' (type: {type(retrieved_data)})")
 
-         menu.exec(self.activity_tree.viewport().mapToGlobal(position))
+            if isinstance(retrieved_data, int):
+                selected_id = retrieved_data # selected_id is now an integer, e.g., 6
+            else:
+                print(f"UI_ERROR_CONTEXT_MENU: UserRole data for item '{item_text_for_menu}' is NOT an integer (it's '{retrieved_data}'). Will not use for operations requiring an ID.")
+        else:
+            print(f"UI_DEBUG_CONTEXT_MENU: No item at click position {position}. Context menu might be limited.")
 
+        add_top_level_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), "Add Top-Level Activity", self)
+        add_top_level_action.setObjectName("addTopLevelAction") # For debugging sender
+        add_top_level_action.triggered.connect(lambda: self.add_activity_action(parent_id=None))
+        menu.addAction(add_top_level_action)
+
+        if clicked_item and selected_id is not None: # This condition should be true if selected_id is 6
+            menu.addSeparator()
+
+            add_sub_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder), f"Add Sub-Activity to '{item_text_for_menu}'", self)
+            add_sub_action.setObjectName(f"addSubActionFor_{selected_id}") # For debugging sender
+
+            # --- CRITICAL DEBUG PRINT ---
+            print(f"UI_DEBUG_CONTEXT_MENU_CONNECT: About to connect 'add_sub_action' for selected_id: {selected_id} (type: {type(selected_id)})")
+            # --- END CRITICAL DEBUG PRINT ---
+
+            # Using functools.partial for robust argument binding
+            action_callable = partial(self.add_activity_action, parent_id=selected_id)
+            add_sub_action.triggered.connect(action_callable)
+            menu.addAction(add_sub_action)
+
+            menu.addSeparator()
+            rename_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView), f"Rename '{item_text_for_menu}'", self)
+            rename_action.setObjectName(f"renameActionFor_{selected_id}")
+            rename_action.triggered.connect(lambda item_to_rename=clicked_item: self.rename_activity_action(item_to_rename_override=item_to_rename))
+            menu.addAction(rename_action)
+
+            config_habit_action = QAction(QIcon.fromTheme("preferences-system", QApplication.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView)), f"Configure '{item_text_for_menu}' as Habit...", self)
+            config_habit_action.setObjectName(f"configHabitActionFor_{selected_id}")
+            config_habit_action.triggered.connect(lambda item_to_config=clicked_item: self.configure_habit_action(item_to_config_override=item_to_config))
+            menu.addAction(config_habit_action)
+
+            menu.addSeparator()
+            delete_action = QAction(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon), f"Delete '{item_text_for_menu}'", self)
+            delete_action.setObjectName(f"deleteActionFor_{selected_id}")
+            delete_action.triggered.connect(lambda item_to_delete=clicked_item: self.delete_activity_action(item_to_delete_override=item_to_delete))
+            menu.addAction(delete_action)
+
+        menu.exec(self.activity_tree.viewport().mapToGlobal(position))    
+    
     def add_activity_action(self, parent_id=None):
-        # (No changes needed here from previous version)
+        sender_action = self.sender()
+        if sender_action:
+            print(f"UI_DEBUG_ADD_ACTIVITY_ACTION_ENTRY: Called by action: '{sender_action.objectName() if sender_action.objectName() else 'Unnamed Action'}' with parent_id: {parent_id} (type: {type(parent_id)})")
+        else:
+            print(f"UI_DEBUG_ADD_ACTIVITY_ACTION_ENTRY: Called directly (no sender QAction) with parent_id: {parent_id} (type: {type(parent_id)})")
+
+        # ... rest of your existing add_activity_action method from the previous good version ...
+        # (The one that started with parent_name_suffix = "" and had the UI_WARNING print)
         parent_name_suffix = ""
-        if parent_id:
-             item = self._find_tree_item_by_id(parent_id)
-             if item: parent_name_suffix = f" under '{item.text(0)}'"
+        parent_item_found_in_tree = False # Flag to check if parent_id corresponds to a visible tree item
+
+        if parent_id is not None: # This means we are trying to add a sub-activity
+            item = self._find_tree_item_by_id(parent_id)
+            if item:
+                parent_name_suffix = f" under '{item.text(0)}'"
+                parent_item_found_in_tree = True
+                print(f"UI_DEBUG_ADD_ACTIVITY_ACTION: For sub-activity, found parent item '{item.text(0)}' in tree with ID: {parent_id}")
+            else:
+                parent_name_suffix = f" under a potential parent (ID: {parent_id})"
+                # This is the UI_WARNING you were seeing. It will now be preceded by the SENDER log.
+                print(f"UI_WARNING_ADD_ACTIVITY_ACTION: For sub-activity, parent_id {parent_id} (type: {type(parent_id)}) was provided, but no corresponding item found in the tree. This ID will still be passed to the DB.")
+        else:
+            print(f"UI_DEBUG_ADD_ACTIVITY_ACTION: Adding a top-level activity (parent_id is None).")
+
         text, ok = QInputDialog.getText(self, "Add Activity", f"Enter name for the new activity{parent_name_suffix}:")
+        # ... (continue with the rest of the method from the previous step where it was working,
+        # make sure to use the one that has the `print(f"UI_DEBUG: Calling db_manager.add_activity with name='{activity_name_to_add}', parent_id={parent_id} ...")` )
         if ok and text.strip():
-             new_activity_id = self.db_manager.add_activity(text.strip(), parent_id)
-             if new_activity_id is not None:
-                 self.load_activities() # Reloads tree and updates UI via selection change
-                 new_item = self._find_tree_item_by_id(new_activity_id)
-                 if new_item:
-                     self.activity_tree.setCurrentItem(new_item)
-                     # handle_selection_change is called automatically by setCurrentItem if selection actually changes
-                     # Force UI update just in case selection didn't strictly "change" but content did
-                     self.update_ui_for_selection()
-                 self.habits_updated.emit() # Notify habit views
-        elif ok: QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
+            activity_name_to_add = text.strip()
+            print(f"UI_DEBUG_ADD_ACTIVITY_ACTION: Calling db_manager.add_activity with name='{activity_name_to_add}', parent_id={parent_id} (type: {type(parent_id)}), parent_item_found_in_tree={parent_item_found_in_tree}")
+            new_activity_id = self.db_manager.add_activity(activity_name_to_add, parent_id)
 
+            if new_activity_id is not None:
+                print(f"UI_INFO_ADD_ACTIVITY_ACTION: Successfully added activity, new ID: {new_activity_id}. Reloading activities.")
+                self.load_activities()
+                new_item = self._find_tree_item_by_id(new_activity_id)
+                if new_item:
+                    self.activity_tree.setCurrentItem(new_item)
+                self.update_ui_for_selection() 
+                self.habits_updated.emit()
+            else:
+                print(f"UI_ERROR_ADD_ACTIVITY_ACTION: db_manager.add_activity returned None for name='{activity_name_to_add}', parent_id={parent_id}.")
+        elif ok: 
+            QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
+        else: 
+            print(f"UI_INFO_ADD_ACTIVITY_ACTION: Add activity cancelled by user.")
 
-    def rename_activity_action(self):
-        # (No changes needed here from previous version)
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
+    def rename_activity_action(self, item_to_rename_override=None):
+        selected_item = item_to_rename_override if item_to_rename_override else self.activity_tree.currentItem()
+        if not selected_item:
+            print("UI_ERROR_RENAME: No item selected or provided for renaming.")
+            return
 
         activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
         current_display_name = selected_item.text(0)
@@ -3420,10 +3594,11 @@ class MainWindow(QMainWindow):
         elif ok and not new_name_stripped:
              QMessageBox.warning(self, "Error", "Activity name cannot be empty.")
 
-    def configure_habit_action(self):
-        # (No changes needed here from previous version)
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
+    def configure_habit_action(self, item_to_config_override=None):
+        selected_item = item_to_config_override if item_to_config_override else self.activity_tree.currentItem()
+        if not selected_item:
+            print("UI_ERROR_CONFIG_HABIT: No item selected or provided for habit configuration.")
+            return
         activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
         display_name = selected_item.text(0)
         activity_name = display_name.replace("[H] ", "", 1) if display_name.startswith("[H] ") else display_name
@@ -3449,42 +3624,52 @@ class MainWindow(QMainWindow):
 
             self.habits_updated.emit() # Notify habit views
 
-    def delete_activity_action(self):
-        # <<< MODIFICATION: Ensure stop_single_task is called before DB delete >>>
-        selected_item = self.activity_tree.currentItem()
-        if not selected_item: return
+
+    def delete_activity_action(self, item_to_delete_override=None): # Keep the fix from previous step here too
+        selected_item = item_to_delete_override if item_to_delete_override else self.activity_tree.currentItem()
+        if not selected_item:
+            print("UI_ERROR_DELETE: No item selected or provided for deletion.")
+            return
+        
         activity_id = selected_item.data(0, Qt.ItemDataRole.UserRole)
+        # Ensure activity_id is an integer, especially if coming from item_to_delete_override
+        if not isinstance(activity_id, int):
+            print(f"UI_ERROR_DELETE: Invalid activity ID ({activity_id}) for item '{selected_item.text(0)}'. Cannot delete.")
+            QMessageBox.warning(self, "Error", "Could not delete item: invalid activity ID.")
+            return
+
         activity_name = selected_item.text(0)
         base_activity_name = activity_name.replace("[H] ", "", 1) if activity_name.startswith("[H] ") else activity_name
 
-        # Warning message logic (remains the same)
-        warning_message = ""; all_descendants = self.db_manager.get_descendant_activity_ids(activity_id)
+        # Warning message logic
+        warning_message = ""
+        all_descendants = self.db_manager.get_descendant_activity_ids(activity_id)
         descendant_count = len(all_descendants) - 1 if activity_id in all_descendants else len(all_descendants)
-        if descendant_count > 0: warning_message += f"\n\nWARNING: Also deletes {descendant_count} child activities!"
+        if descendant_count > 0:
+            warning_message += f"\n\nWARNING: Also deletes {descendant_count} child activities!"
         warning_message += "\nAll associated time/habit entries will also be deleted!"
-        reply = QMessageBox.question(self, "Confirm Deletion", f"Delete '{base_activity_name}'?{warning_message}",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                     f"Delete '{base_activity_name}'?{warning_message}",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
 
         if reply == QMessageBox.StandardButton.Yes:
             was_habit, _, _ = self.db_manager.get_activity_habit_config(activity_id)
             is_habit = was_habit is not None and was_habit != HABIT_TYPE_NONE
 
-            # <<< MODIFICATION: Stop timer *before* deleting from DB >>>
-            if activity_id in self.active_timer_windows or self.countdown_activity_id == activity_id:
+            if activity_id in self.active_timer_windows:
                 print(f"Stopping timer for activity being deleted: {activity_id}")
-                # Stop without saving the final interval, as the entry would be deleted anyway
                 self.stop_single_task(activity_id, save_entry=False)
 
-            # Now proceed with deletion
             if self.db_manager.delete_activity(activity_id):
-                 self.load_activities() # Reload tree (selection is cleared, UI updates)
-                 if is_habit:
-                     self.habits_updated.emit()
+                self.load_activities()
+                if is_habit:
+                    self.habits_updated.emit()
             else:
-                 QMessageBox.critical(self, "Deletion Error", f"Failed to delete activity '{base_activity_name}'.")
-
-    # --- Dialog Openers (open_entry_management, open_daily_snapshot, open_habit_tracker) ---
-    # (No changes needed here from previous version)
+                QMessageBox.critical(self, "Deletion Error",
+                                     f"Failed to delete activity '{base_activity_name}'.")
+    
     def open_entry_management(self):
         if len(self.selected_activity_details) != 1:
             QMessageBox.warning(self, "Selection Error", "Please select exactly one activity to manage entries.")
