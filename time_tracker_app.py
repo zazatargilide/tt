@@ -4,7 +4,7 @@ import uuid
 import sqlite3
 import time
 import os
-import math # <-- Added for drawing percentages
+import math
 from collections import defaultdict, deque
 # Import all necessary PyQt6 classes
 from PyQt6.QtWidgets import (
@@ -498,6 +498,111 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"Error retrieving detailed time entries for activity {activity_id}: {e}")
             return []
+
+
+    def _is_habit_done_for_global_streak(self, logged_value, habit_type, habit_goal):
+        """
+        Determines if a habit instance meets its 'done' criteria for global streak calculation.
+        - Binary: Done if 1.0
+        - Percentage: Done if >= 100.0
+        - Numeric with Goal: Done if value >= goal
+        - Numeric without Goal: Cannot be 'done' for this metric as '100%' is undefined.
+        """
+        if logged_value is None:
+            return False
+        
+        if habit_type == HABIT_TYPE_BINARY:
+            return logged_value == 1.0
+        elif habit_type == HABIT_TYPE_PERCENTAGE:
+            return logged_value >= 100.0 # Consistent with HeatmapWidget._is_habit_done
+        elif habit_type == HABIT_TYPE_NUMERIC:
+            if habit_goal is not None and habit_goal > 0:
+                return logged_value >= habit_goal
+            return False # Numeric without a goal doesn't count as "100% done"
+        return False
+
+    def calculate_global_daily_streaks(self):
+        """
+        Calculates current and max global daily streaks based on >75% of all habits being "done".
+        Returns: (current_streak, max_streak)
+        """
+        if not self.conn: return (0, 0)
+
+        all_configured_habits = self.get_all_habits() # Fetches [(id, name, type, unit, goal), ...]
+        if not all_configured_habits:
+            print("StreakCalc: No habits configured.")
+            return (0, 0)
+
+        total_configurable_habits = len(all_configured_habits)
+        # Create a dictionary for quick lookup of habit type and goal by id
+        habit_details_map = {h[0]: {"type": h[2], "goal": h[4]} for h in all_configured_habits}
+
+        # Fetch all logs and group them by date
+        logs_by_date = defaultdict(dict) # {'YYYY-MM-DD': {activity_id: value}}
+        earliest_log_date_str = None
+        try:
+            self.cursor.execute("SELECT log_date, activity_id, value FROM habit_logs ORDER BY log_date ASC")
+            all_db_logs = self.cursor.fetchall()
+            if not all_db_logs:
+                print("StreakCalc: No habit logs found in the database.")
+                return (0, 0)
+            
+            earliest_log_date_str = all_db_logs[0][0]
+            for log_date_str, activity_id, value in all_db_logs:
+                logs_by_date[log_date_str][activity_id] = value
+        except sqlite3.Error as e:
+            print(f"StreakCalc Error: Fetching logs failed: {e}")
+            return (0, 0)
+
+        current_s = 0
+        max_s = 0
+        running_s = 0
+        
+        try:
+            loop_q_date = QDate.fromString(earliest_log_date_str, "yyyy-MM-dd")
+            if not loop_q_date.isValid():
+                print(f"StreakCalc Error: Invalid earliest log date '{earliest_log_date_str}'.")
+                return (0,0)
+        except Exception as e:
+            print(f"StreakCalc Error: Processing earliest log date '{earliest_log_date_str}': {e}")
+            return (0,0)
+
+        today_q_date = QDate.currentDate()
+
+        while loop_q_date <= today_q_date:
+            date_str_iter = loop_q_date.toString("yyyy-MM-dd")
+            num_done_this_day = 0
+            logs_for_current_day = logs_by_date.get(date_str_iter, {})
+
+            for habit_id, details in habit_details_map.items():
+                logged_value = logs_for_current_day.get(habit_id)
+                if self._is_habit_done_for_global_streak(logged_value, details["type"], details["goal"]):
+                    num_done_this_day += 1
+            
+            is_successful_day = False
+            if total_configurable_habits > 0: # Should always be true here
+                if (num_done_this_day / total_configurable_habits) > 0.75:
+                    is_successful_day = True
+            
+            if is_successful_day:
+                running_s += 1
+            else:
+                max_s = max(max_s, running_s) # Store streak before resetting
+                running_s = 0
+            
+            if loop_q_date == today_q_date: # If today has been processed
+                current_s = running_s
+            
+            loop_q_date = loop_q_date.addDays(1)
+        
+        max_s = max(max_s, running_s) # Final check for max_streak
+
+        # If today was not successful, current_s (which is running_s) would be 0.
+        # If today was successful, current_s holds the ongoing streak.
+        # If there are no logs for today, the loop still processes today as an "unsuccessful" day
+        # (num_done_this_day will be 0), correctly setting running_s to 0.
+        print(f"StreakCalc: Current={current_s}, Max={max_s} (TotalHabits={total_configurable_habits})")
+        return (current_s, max_s)
 
     def update_time_entry(self, entry_id, new_duration_seconds=None, new_timestamp_qdatetime=None, new_entry_type=None):
         """
@@ -2574,13 +2679,18 @@ class HabitTrackerDialog(QDialog):
     # Optional: Define a signal if this dialog needs to inform others of changes
     # habits_logged_signal = pyqtSignal(int, str) # activity_id, date_str
 
-    def __init__(self, db_manager: DatabaseManager, main_window_parent=None): # Pass parent for signal connection
-        super().__init__(main_window_parent) # Use main_window_parent
+    def __init__(self, db_manager: DatabaseManager, main_window_instance_for_signals=None): # Renamed for clarity
+        super().__init__(None) # MODIFIED: Explicitly pass None to make it a top-level window for stacking
+        
+        # QDialog по умолчанию является окном верхнего уровня, если родитель None.
+        # Дополнительные флаги окна обычно не требуются для этого поведения.
+
         self.db_manager = db_manager
         self.current_qdate = QDate.currentDate() # Tracks the month/year being viewed
 
         # --- Model ---
-        self.habit_model = HabitTableModel(self.db_manager, self)
+        # self (диалог) является родителем для модели, это нормально
+        self.habit_model = HabitTableModel(self.db_manager, self) 
 
         self.setWindowTitle("Habit Tracker (Model/View)") # Updated title
         self.setMinimumSize(800, 600)
@@ -2588,11 +2698,11 @@ class HabitTrackerDialog(QDialog):
         # --- Main Layout ---
         layout = QVBoxLayout(self)
 
-        self.grid_animation_timer = QTimer(self) # Назовем его так для ясности
-        self.grid_animation_timer.timeout.connect(self._trigger_grid_update) # Слот для обновления сетки
-        self.grid_animation_timer.start(100) # Интервал обновления
+        self.grid_animation_timer = QTimer(self) 
+        self.grid_animation_timer.timeout.connect(self._trigger_grid_update) 
+        self.grid_animation_timer.start(100) 
         
-        # --- Navigation Layout (Remains the same) ---
+        # --- Navigation Layout ---
         nav_layout = QHBoxLayout()
         self.prev_month_button = QPushButton("< Prev")
         self.prev_month_button.clicked.connect(self.go_prev_month)
@@ -2613,53 +2723,41 @@ class HabitTrackerDialog(QDialog):
         # --- Habit Grid (Now QTableView) ---
         self.habit_grid = QTableView()
         self.habit_grid.setModel(self.habit_model)
-        self.habit_grid.setItemDelegate(HabitCellDelegate(self)) # Делегат рисует градиент
-       
+        self.habit_grid.setItemDelegate(HabitCellDelegate(self))
+        
         # --- View Configuration ---
-        self.habit_grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers) # We handle edits on double-click
+        self.habit_grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.habit_grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        # self.habit_grid.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems) # Default is usually fine
-
-        # Configure Headers
+        
         v_header = self.habit_grid.verticalHeader()
         h_header = self.habit_grid.horizontalHeader()
-
-        # Увеличим высоту строк (подберите значение по вкусу)
-        v_header.setDefaultSectionSize(45) # Было ResizeToContents или 30
-        v_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed) # Или Interactive, если хотите менять вручную
-
-        # Увеличим ширину столбцов (подберите значение по вкусу)
-        h_header.setDefaultSectionSize(80) # Было 45
-        h_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed) # Или Interactive
-
+        v_header.setDefaultSectionSize(45) 
+        v_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed) 
+        h_header.setDefaultSectionSize(80) 
+        h_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed) 
         v_header.setToolTip("Habits (Right-click to reorder)")
         h_header.setToolTip("Day of Month")
         
-        # Enable context menu on vertical header for reordering
         v_header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         v_header.customContextMenuRequested.connect(self.show_header_context_menu)
-
-        # Connect double-click signal
-        self.habit_grid.doubleClicked.connect(self.on_grid_double_clicked) # Connect to QModelIndex signal
-
+        self.habit_grid.doubleClicked.connect(self.on_grid_double_clicked)
         layout.addWidget(self.habit_grid)
 
         # --- Bottom Buttons ---
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        # Подключаем reject к нашему методу для остановки таймера
-        button_box.rejected.connect(self.reject)
+        button_box.rejected.connect(self.reject) # self.reject() был определен для остановки таймера
         layout.addWidget(button_box)
 
-        self.setLayout(layout)
+        self.setLayout(layout) # Убедитесь, что layout установлен для диалога
 
-        # --- Connect to MainWindow's update signal if parent is passed ---
-        if main_window_parent and hasattr(main_window_parent, 'habits_updated'):
-            main_window_parent.habits_updated.connect(self.refresh_view_slot)
-            print("HabitTrackerDialog connected to MainWindow.habits_updated signal.")
+        # --- Connect to MainWindow's update signal if an instance was provided ---
+        # main_window_instance_for_signals используется здесь для подключения сигнала
+        if main_window_instance_for_signals and hasattr(main_window_instance_for_signals, 'habits_updated'):
+            main_window_instance_for_signals.habits_updated.connect(self.refresh_view_slot)
+            print("HabitTrackerDialog connected to MainWindow.habits_updated signal (as top-level).")
 
-        self.refresh_view() # Initial load
+        self.refresh_view() # Initial load    # --- Slot for External Updates ---
 
-    # --- Slot for External Updates ---
     def refresh_view_slot(self):
         """Slot to be connected to external signals indicating data might have changed."""
         print("HabitTrackerDialog received external update signal. Refreshing view.")
@@ -2702,33 +2800,49 @@ class HabitTrackerDialog(QDialog):
             new_value_to_log = None if current_value_from_model == 1.0 else 1.0
             ok_to_set_data = True
 
-        elif habit_type == HABIT_TYPE_PERCENTAGE:
-            current_total_percentage = current_value_from_model if current_value_from_model is not None else 0.0
-            
-            prompt_title = f"Log '{habit_name}' (%)"
-            prompt_text = (f"Current daily total: {current_total_percentage:.0f}%. "
-                           f"Enter percentage points for THIS INSTANCE to ADD for {date_str}:\n"
-                           f"(Max total 100%. Enter 0 or Cancel for no change to total.)")
-            
-            # User always inputs the amount for the current instance/session
-            percentage_this_instance, ok = QInputDialog.getDouble(
+        elif habit_type == HABIT_TYPE_NUMERIC:
+            current_total_numeric = current_value_from_model if current_value_from_model is not None else 0.0
+            unit_str = f" ({habit_unit})" if habit_unit else ""
+            prompt_title = f"Log '{habit_name}'"
+            prompt_text = (f"Current daily total: {current_total_numeric:g}{unit_str}. "
+                            f"Enter value for THIS INSTANCE to ADD for {date_str}:\n"
+                            f"(Enter 0 or Cancel for no change to total. Use negative to subtract from total.)")
+
+            value_this_instance, ok = QInputDialog.getDouble(
                 self, prompt_title, prompt_text,
-                value=0.0,  # Default to adding 0 for this instance
-                min=0,      
-                max=100.0,  # Max for a single instance (can be adjusted if needed)
-                decimals=0
+                value=0.0, 
+                min=-999999.0, max=999999.0, 
+                decimals=2 
             )
 
             if ok:
-                if percentage_this_instance > 0: # Only if they log a positive amount for this instance
-                    new_cumulative_total = min(100.0, current_total_percentage + percentage_this_instance)
-                    # Update if the new cumulative total is different from the old one
-                    if new_cumulative_total != current_total_percentage:
+                if current_value_from_model is None and value_this_instance == 0.0:
+                    # *** MODIFIED QMessageBox SECTION ***
+                    reply = QMessageBox.question(self, "Confirm Zero Log",
+                                                    f"You entered 0 for the first log of '{habit_name}' on {date_str}.\n\n"
+                                                    f"• Press 'Save' to log an explicit total of '0'.\n"
+                                                    f"• Press 'Discard' to skip logging this instance (day remains unlogged).\n"
+                                                    f"• Press 'Cancel' to abort this logging attempt.",
+                                                    buttons=QMessageBox.StandardButton.Save | 
+                                                            QMessageBox.StandardButton.Discard | 
+                                                            QMessageBox.StandardButton.Cancel,
+                                                    defaultButton=QMessageBox.StandardButton.Cancel) # Default to Cancel
+
+                    if reply == QMessageBox.StandardButton.Save: # Log Zero for the day
+                        new_value_to_log = 0.0
+                        ok_to_set_data = True
+                    elif reply == QMessageBox.StandardButton.Discard: # Skip logging this zero instance
+                        print(f"User chose to discard logging initial zero for '{habit_name}'.")
+                        ok_to_set_data = False # No data will be set, effectively skipping
+                    # If Cancel (or dialog closed), ok_to_set_data remains False
+
+                elif value_this_instance != 0.0: 
+                    new_cumulative_total = current_total_numeric + value_this_instance
+                    if new_cumulative_total != current_total_numeric or \
+                        (current_value_from_model is None and new_cumulative_total != 0): # also log if it was None and now becomes non-zero
                         new_value_to_log = new_cumulative_total
                         ok_to_set_data = True
-                # If percentage_this_instance is 0, no change to total, ok_to_set_data remains False.
-            # else: User cancelled dialog
-
+                        
         elif habit_type == HABIT_TYPE_NUMERIC:
             current_total_numeric = current_value_from_model if current_value_from_model is not None else 0.0
             unit_str = f" ({habit_unit})" if habit_unit else ""
@@ -2820,22 +2934,46 @@ class HabitTrackerDialog(QDialog):
 
     # --- Data Loading / Refresh Method (Simplified) ---
     def refresh_view(self):
-        """Loads and displays habit data by telling the model to update."""
+        """Loads and displays habit data by telling the model to update
+           and scrolls to today's column if viewing the current month.
+        """
         year = self.current_qdate.year()
         month = self.current_qdate.month()
 
         # Update month/year label
-        self.month_year_label.setText(self.current_qdate.toString("MMMM yyyy")) # Corrected format string
+        # Используем QLocale для получения названия месяца, чтобы оно соответствовало локали системы
+        locale = QLocale() 
+        month_name = locale.monthName(month, QLocale.FormatType.LongFormat)
+        self.month_year_label.setText(f"{month_name} {year}") # e.g., "Май 2025"
 
         # Tell the model to load data for the new period
         self.habit_model.load_data(year, month)
 
-        # Optional: Auto-resize columns/rows after model reset if needed, though ResizeToContents might handle it.
-        # self.habit_grid.resizeColumnsToContents()
-        # self.habit_grid.resizeRowsToContents() # Already set resize mode
+        # --- Scroll to today's column if viewing current month ---
+        today_qdate = QDate.currentDate()
+        if year == today_qdate.year() and month == today_qdate.month():
+            # Это текущий месяц и год
+            today_column_index = today_qdate.day() - 1 # 0-based column index
+
+            # Убедимся, что индекс колонки и модель валидны перед прокруткой
+            if self.habit_model.rowCount() > 0 and \
+               0 <= today_column_index < self.habit_model.columnCount():
+                
+                # Целевой индекс для прокрутки (первая строка, колонка сегодняшнего дня)
+                target_model_index = self.habit_model.index(0, today_column_index) 
+                
+                # Даем Qt обработать события, чтобы гарантировать обновление layout перед прокруткой
+                # Это может помочь, если прокрутка иногда не срабатывает сразу после сброса модели
+                QApplication.processEvents() 
+
+                self.habit_grid.scrollTo(target_model_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+                print(f"HabitTrackerDialog: Scrolled to today's column ({today_column_index + 1}) in current month view.")
+            else:
+                # Эта ситуация маловероятна, если модель правильно загружает дни месяца
+                print(f"HabitTrackerDialog: In current month, but cannot scroll. Rows: {self.habit_model.rowCount()}, Today's Col Idx: {today_column_index}, Total Col Count: {self.habit_model.columnCount()}")
+        # --- End scroll logic ---
 
         print(f"HabitTrackerDialog view refreshed for {year}-{month:02d}.")
-
 
     # --- Context Menu Method (Uses Model) ---
     def show_header_context_menu(self, position):
@@ -2887,43 +3025,44 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db_manager = DatabaseManager()
-        self.qtimer = QTimer(self) # One global QTimer for UI updates
+        self.qtimer = QTimer(self) 
         self.qtimer.timeout.connect(self.update_timer)
 
-        # --- State Variables ---
-        self.selected_activity_details = [] # List of selected: [(id, name), ...]
-        self.active_timer_windows = {}      # Active tasks: {activity_id: task_data_dict}
-        # task_data_dict = {'window': TimerWindow_instance, 'state': int,
-        #                   'current_interval_start_time': float,
-        #                   'total_session_work_sec': float, 'total_session_break_sec': float,
-        #                   'session_id': float, # Unique ID for this task instance (start time)
-        #                   'activity_name': str }
-
-          # --- Multi-tasking window colors ---
+        self.selected_activity_details = [] 
+        self.active_timer_windows = {}   
         self._multitask_color_index = 0
         self.multitask_colors = [
-             QColor(0, 0, 0, 180), QColor(90, 0, 0, 190), QColor(90, 45, 0, 190),
-             QColor(0, 70, 0, 190), QColor(0, 70, 70, 190), QColor(0, 0, 90, 190),
-             QColor(60, 0, 90, 190)
+            QColor(0, 0, 0, 180), QColor(90, 0, 0, 190), QColor(90, 45, 0, 190),
+            QColor(0, 70, 0, 190), QColor(0, 70, 70, 190), QColor(0, 0, 90, 190),
+            QColor(60, 0, 90, 190)
         ]
-
-        # --- UI Elements ---
+        # Initialize UI element attributes to None before init_ui
         self.activity_tree = None
         self.manage_entries_button = None
         self.snapshot_button = None
         self.habit_tracker_button = None
         self.start_tasks_button = None
-        self.start_countdowns_button = None # <<< MODIFICATION: Renamed
+        self.start_countdowns_button = None
         self.status_label = None
         self.heatmap_widget = None
-
+        self.current_global_streak_label = None # Add new labels here
+        self.max_global_streak_label = None   # Add new labels here
+        self.habit_tracker_dialog_instance = None 
+        
         self.init_ui()
         self.apply_dark_theme()
-        self.load_activities()
+        self.load_activities() # This should populate habits for streak calculation
 
-        if self.heatmap_widget:
+        if self.heatmap_widget: # Should exist after init_ui
             self.habits_updated.connect(self.heatmap_widget.refresh_data)
             print("Connected habits_updated signal to heatmap refresh.")
+        
+        # Connect habits_updated to the new streak display update method
+        self.habits_updated.connect(self.update_global_streak_display)
+        print("Connected habits_updated signal to global streak display update.")
+        
+        self.update_global_streak_display() # Initial call to display streaks
+        self.habits_updated.connect(self.update_global_streak_display)
 
     def init_ui(self):
         self.setWindowTitle("Ritual - Time Tracker")
@@ -2990,10 +3129,27 @@ class MainWindow(QMainWindow):
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.status_label)
 
-        # --- Heatmap Widget ---
+        streak_display_layout = QHBoxLayout() # To hold current and max side-by-side
+        self.current_global_streak_label = QLabel("Current Streak: -- day(s)")
+        self.max_global_streak_label = QLabel("Max Streak: -- day(s)")
+
+
+
+        streak_display_layout.addStretch(1) # Add stretch BEFORE the first label
+        streak_display_layout.addWidget(self.current_global_streak_label)
+        streak_display_layout.addSpacing(40) # Add some fixed spacing between the two labels (adjust as needed)
+        streak_display_layout.addWidget(self.max_global_streak_label)
+        streak_display_layout.addStretch(1) # Add stretch AFTER the second label
+
+        main_layout.addLayout(streak_display_layout) # Add this QHBoxLayout to the main vertical layout
+        # --- END GLOBAL STREAK LABELS ---
+
+        # --- Heatmap Widget (comes after streak labels) ---
         main_layout.addWidget(QLabel("Yearly Habit Heatmap:"))
         self.heatmap_widget = HeatmapWidget(self.db_manager, self)
-        main_layout.addWidget(self.heatmap_widget, 0)
+        main_layout.addWidget(self.heatmap_widget, 0) 
+        
+        self.setCentralWidget(central_widget) # Ensure this is at the end if main_layout is for central_widget
 
     def apply_dark_theme(self):
         # (Your existing dark theme code remains here)
@@ -3031,6 +3187,25 @@ class MainWindow(QMainWindow):
         self.activity_tree.clearSelection()
         self.selected_activity_details = []
         self.update_ui_for_selection() # Update buttons and status bar
+
+    def update_global_streak_display(self):
+        """Fetches and updates the global daily streak labels."""
+        if not self.db_manager:
+            print("UI Update Streak: No DB Manager.")
+            return
+        try:
+            current_s, max_s = self.db_manager.calculate_global_daily_streaks()
+            if self.current_global_streak_label:
+                self.current_global_streak_label.setText(f"Current Daily Streak: {current_s} day(s)")
+            if self.max_global_streak_label:
+                self.max_global_streak_label.setText(f"Max Daily Streak: {max_s} day(s)")
+            print(f"UI: Updated global streak display: Current={current_s}, Max={max_s}")
+        except Exception as e:
+            print(f"Error updating global streak display: {e}")
+            if self.current_global_streak_label:
+                self.current_global_streak_label.setText("Current Daily Streak: Error")
+            if self.max_global_streak_label:
+                self.max_global_streak_label.setText("Max Daily Streak: Error")
 
     def _find_tree_item_by_id(self, activity_id):
         """Helper to find a tree item by its stored activity ID."""
@@ -3950,12 +4125,34 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def open_habit_tracker(self):
-        # Pass self so dialog can connect to habits_updated signal
-        dialog = HabitTrackerDialog(self.db_manager, self)
-        dialog.exec()
+        """Opens the HabitTrackerDialog as a non-modal window.
+        If an instance already exists and is visible, it will be activated.
+        """
+        if self.habit_tracker_dialog_instance is None:
+            print("Creating new HabitTrackerDialog instance (as top-level).")
+            # Передаем 'self' (экземпляр MainWindow) для main_window_instance_for_signals,
+            # чтобы HabitTrackerDialog мог подключиться к сигналу habits_updated.
+            # HabitTrackerDialog внутренне вызовет super().__init__(None).
+            self.habit_tracker_dialog_instance = HabitTrackerDialog(
+                self.db_manager, 
+                main_window_instance_for_signals=self # MODIFIED: передаем MainWindow для подключения сигнала
+            )
+            # Когда диалог закрывается (неважно как), обнуляем ссылку на него
+            self.habit_tracker_dialog_instance.finished.connect(self.on_habit_tracker_dialog_closed)
+            self.habit_tracker_dialog_instance.show()
+        else:
+            print("HabitTrackerDialog instance already exists. Activating.")
+            self.habit_tracker_dialog_instance.show() # Показать, если был скрыт
+            self.habit_tracker_dialog_instance.raise_() # Поднять наверх
+            self.habit_tracker_dialog_instance.activateWindow() # Дать фокус
 
-# In class MainWindow:
-# In class MainWindow:
+    def on_habit_tracker_dialog_closed(self, result): 
+        """Slot to clear the reference when the HabitTrackerDialog is closed."""
+        print(f"HabitTrackerDialog closed (result: {result}). Clearing instance reference.")
+        if self.habit_tracker_dialog_instance:
+            # deleteLater() безопаснее для удаления QObject, особенно если есть ожидающие события
+            self.habit_tracker_dialog_instance.deleteLater() 
+            self.habit_tracker_dialog_instance = None
 
     def prompt_and_log_habit_after_timer(self, activity_id, activity_name, habit_config, work_duration_seconds):
         # activity_name IS DEFINED HERE as a parameter

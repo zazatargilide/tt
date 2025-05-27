@@ -1,4 +1,4 @@
-# Ritual Time Tracker (v0.0931)
+# Ritual Time Tracker (v0.0935)
 
 A desktop application for tracking time spent on hierarchical activities and monitoring daily habit completion, built with Python and PyQt6.
 
