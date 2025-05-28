@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 # Import all necessary PyQt6 classes
 from PyQt6.QtWidgets import (
     QMenu, QStyle, QSizePolicy, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTreeWidgetItemIterator, QLineEdit, QLabel, QMessageBox, QListWidgetItem,
+    QPushButton, QTreeWidgetItemIterator, QGroupBox, QLineEdit, QLabel, QMessageBox, QListWidgetItem,
     QDialog, QDialogButtonBox, QInputDialog, QDateTimeEdit, QSpinBox, QCheckBox, QRadioButton,
     QDateEdit, QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QTableView,
     QTreeWidget, QTreeWidgetItem, QMenu, QAbstractItemView, QStyledItemDelegate, QStyleOptionViewItem,
@@ -499,6 +499,31 @@ class DatabaseManager:
             print(f"Error retrieving detailed time entries for activity {activity_id}: {e}")
             return []
 
+    def calculate_average_entry_duration_by_type(self, activity_id, entry_type):
+        """
+        Calculates the average duration for time_entries of a specific type 
+        ('work' or 'break') for a given activity.
+        Returns 0 if no such entries or an error occurs.
+        """
+        if not self.conn or not activity_id or entry_type not in ('work', 'break'):
+            print(f"DB_AVG_TYPE_ERR: Invalid params for avg entry duration by type. ActID: {activity_id}, Type: {entry_type}")
+            return 0
+        try:
+            self.cursor.execute(
+                "SELECT AVG(duration_seconds) FROM time_entries WHERE activity_id = ? AND entry_type = ?",
+                (activity_id, entry_type)
+            )
+            result = self.cursor.fetchone()
+            # result[0] will be None if no matching rows are found, AVG of NULL is NULL.
+            avg_duration = result[0] if result and result[0] is not None else 0
+            # print(f"DB_AVG_TYPE_INFO: Avg duration for ActID {activity_id}, Type '{entry_type}': {avg_duration}")
+            return float(avg_duration)
+        except sqlite3.Error as e:
+            print(f"DB_AVG_TYPE_ERR: Error calculating average duration for activity {activity_id}, type {entry_type}: {e}")
+            return 0
+        except Exception as ex: # Catch any other unexpected errors
+            print(f"DB_AVG_TYPE_UNEXPECTED_ERR: Unexpected error for activity {activity_id}, type {entry_type}: {ex}")
+            return 0
 
     def _is_habit_done_for_global_streak(self, logged_value, habit_type, habit_goal):
         """
@@ -1872,8 +1897,8 @@ class DailySnapshotDialog(QDialog):
         header_summary = self.summary_tree.header()
         header_summary.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Activity
         header_summary.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # Work
-        header_summary.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Break
-        header_summary.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # Total
+        header_summary.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Break  <<< ИСПРАВЛЕНО
+        header_summary.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) 
         self.summary_tree.setSortingEnabled(True)
         self.summary_tree.sortByColumn(3, Qt.SortOrder.DescendingOrder) # Сортировка по общему времени
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
@@ -2227,6 +2252,421 @@ class ConfigureHabitDialog(QDialog):
             # Don't close the dialog on error
 # --- End of ConfigureHabitDialog ---
 
+class PostSessionReviewDialog(QDialog):
+    """
+    Dialog for reviewing and saving intervals from a completed work/countdown session.
+    Allows users to select which intervals to save, edit their durations, or discard them.
+    Displays current session totals and highlights deviations from historical averages.
+    """
+    # Signal: activity_id, activity_name, session_id, list of saved_entry_details
+    # Each dict in list: {'type': str, 'duration_seconds': int}
+    session_reviewed_and_saved = pyqtSignal(int, str, float, list)
+
+    def __init__(self, db_manager: 'DatabaseManager',
+                activity_id: int, activity_name: str, session_id: float,
+                recorded_intervals_data: list, main_window_instance: 'MainWindow', parent=None):
+   
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.activity_id = activity_id
+        self.activity_name = activity_name
+        self.session_id = session_id
+        self.main_window_instance = main_window_instance # Store for format_time
+
+        self.deviation_threshold = 0.25  # Default to 25%. You can change this!
+                                        # Try 0.15 (15%), 0.20 (20%), 0.30 (30%) etc.
+
+        self.review_intervals = []
+        for i, interval_data in enumerate(recorded_intervals_data):
+            self.review_intervals.append({
+                'temp_id': i,
+                'type': interval_data['type'],
+                'original_duration': interval_data['duration_seconds'],
+                'final_duration': interval_data['duration_seconds'],
+                'marked_for_save': True if interval_data['duration_seconds'] > 0 else False # Default to save valid intervals
+            })
+
+        self.setWindowTitle(f"Review Session: {self.activity_name}")
+        self.setMinimumSize(650, 550) # Increased size
+
+        # --- Fetch historical averages ---
+        self.avg_individual_work_duration = self.db_manager.calculate_average_entry_duration_by_type(self.activity_id, 'work')
+        self.avg_individual_break_duration = self.db_manager.calculate_average_entry_duration_by_type(self.activity_id, 'break')
+
+        avg_session_times = self.db_manager.calculate_average_session_times(self.activity_id)
+        self.avg_session_work_total = avg_session_times[0]
+        self.avg_session_break_total = avg_session_times[1]
+        self.avg_session_grand_total = avg_session_times[2]
+
+        # --- Colors ---
+        palette = self.palette() # Get the current application palette
+        self.prominent_color = palette.color(QPalette.ColorRole.Text) # Usually white or light in dark themes
+        
+        # For subtle color, try a less saturated and slightly darker version of the prominent text color
+        h, s, v, a = self.prominent_color.getHsvF()
+        self.subtle_color = QColor.fromHsvF(h, max(0, s * 0.6), max(0, v * 0.7), a)
+
+        # Fallback if colors are too similar or subtle_color is still too bright
+        if self.subtle_color == self.prominent_color or self.subtle_color.valueF() > 0.85 and self.prominent_color.valueF() > 0.9:
+            self.subtle_color = QColor(150, 150, 150) # A noticeable gray
+
+        self._init_ui()
+        # _populate_table and _update_current_session_totals_and_styles will be called by _init_ui or subsequently
+        self._update_current_session_totals_and_styles() # Initial calculation and styling of totals
+        self._populate_table()                           # Populates table and styles rows
+
+    def _is_significant_deviation(self, current_value, average_value):
+        threshold_to_use = self.deviation_threshold
+        if average_value is None or average_value <= 0:
+            return False 
+        if current_value is None:
+            return False
+        
+        # Calculate relative deviation
+        relative_deviation = abs(current_value - average_value) / average_value
+        is_deviating = relative_deviation > threshold_to_use
+        
+        # print(f"DEV_CHECK_RESULT: Ratio={relative_deviation:.4f}, IsDeviating={is_deviating}") # Optional Debug
+        return is_deviating
+
+    def _get_deviation_color(self, current_value, average_value):
+        if self._is_significant_deviation(current_value, average_value):
+            return self.prominent_color
+        else:
+            return self.subtle_color
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+
+        info_label = QLabel(
+            f"Review recorded intervals for <b>'{self.activity_name}'</b> (Session ID: {self.session_id:.0f}).<br>"
+            f"Adjust durations or uncheck 'Save'. Durations significantly different (>10%) from historical averages are highlighted in <b>{self.prominent_color.name()}</b>, others in <font color='{self.subtle_color.name()}'>grayer tone</font>."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        self.intervals_table = QTableWidget()
+        self.intervals_table.setColumnCount(4)
+        self.intervals_table.setHorizontalHeaderLabels(["Save?", "Type", "Original Duration", "Final Duration"])
+        self.intervals_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.intervals_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.intervals_table.verticalHeader().setVisible(False)
+
+        header = self.intervals_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.intervals_table.doubleClicked.connect(self._edit_selected_duration_from_table)
+        layout.addWidget(self.intervals_table)
+
+        table_buttons_layout = QHBoxLayout()
+        self.mark_all_button = QPushButton("Mark All to Save")
+        self.mark_all_button.clicked.connect(self._mark_all_for_save)
+        table_buttons_layout.addWidget(self.mark_all_button)
+        self.unmark_all_button = QPushButton("Unmark All")
+        self.unmark_all_button.clicked.connect(self._unmark_all_for_save)
+        table_buttons_layout.addWidget(self.unmark_all_button)
+        table_buttons_layout.addStretch()
+        self.edit_duration_button = QPushButton("Edit Selected Duration")
+        self.edit_duration_button.clicked.connect(self._edit_selected_duration_from_button)
+        table_buttons_layout.addWidget(self.edit_duration_button)
+        self.remove_button = QPushButton("Remove Selected from List")
+        self.remove_button.setToolTip("This interval will not be saved and removed from this review.")
+        self.remove_button.clicked.connect(self._remove_selected_interval)
+        table_buttons_layout.addWidget(self.remove_button)
+        layout.addLayout(table_buttons_layout)
+
+        totals_group_box = QGroupBox("Current Session Totals (vs Historical Session Averages)")
+        totals_layout = QFormLayout(totals_group_box)
+        self.current_session_work_label = QLabel("Work: N/A")
+        self.current_session_break_label = QLabel("Break: N/A")
+        self.current_session_grand_total_label = QLabel("Total: N/A")
+        totals_layout.addRow("Total Work:", self.current_session_work_label)
+        totals_layout.addRow("Total Break:", self.current_session_break_label)
+        totals_layout.addRow("Grand Total:", self.current_session_grand_total_label)
+        layout.addWidget(totals_group_box)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        save_button = button_box.button(QDialogButtonBox.StandardButton.Save)
+        if save_button: # Ensure button exists
+            save_button.setText("Save Marked & Close")
+        button_box.accepted.connect(self._save_marked_and_accept) # QDialogButtonBox.Save maps to accepted
+        button_box.rejected.connect(self.reject) # QDialogButtonBox.Cancel maps to rejected
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+
+    def _format_duration_for_display(self, seconds):
+        # Helper to use the static method from MainWindow instance
+        return self.main_window_instance.format_time(seconds)
+
+    def _update_current_session_totals_and_styles(self):
+        current_total_work = sum(iv['final_duration'] for iv in self.review_intervals if iv['type'] == 'work')
+        current_total_break = sum(iv['final_duration'] for iv in self.review_intervals if iv['type'] == 'break')
+        current_grand_total = current_total_work + current_total_break
+
+        self.current_session_work_label.setText(
+            f"{self._format_duration_for_display(current_total_work)} "
+            f"(Avg: {self._format_duration_for_display(self.avg_session_work_total)})"
+        )
+        self.current_session_break_label.setText(
+            f"{self._format_duration_for_display(current_total_break)} "
+            f"(Avg: {self._format_duration_for_display(self.avg_session_break_total)})"
+        )
+        self.current_session_grand_total_label.setText(
+            f"{self._format_duration_for_display(current_grand_total)} "
+            f"(Avg: {self._format_duration_for_display(self.avg_session_grand_total)})"
+        )
+
+        work_color = self._get_deviation_color(current_total_work, self.avg_session_work_total)
+        self.current_session_work_label.setStyleSheet(f"color: {work_color.name()};")
+
+        break_color = self._get_deviation_color(current_total_break, self.avg_session_break_total)
+        self.current_session_break_label.setStyleSheet(f"color: {break_color.name()};")
+
+        total_color = self._get_deviation_color(current_grand_total, self.avg_session_grand_total)
+        self.current_session_grand_total_label.setStyleSheet(f"color: {total_color.name()};")
+
+    def _populate_table(self):
+        self.intervals_table.setRowCount(0)
+        self.intervals_table.setRowCount(len(self.review_intervals))
+
+        for row, interval in enumerate(self.review_intervals):
+            save_checkbox_item = QTableWidgetItem()
+            save_checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            save_checkbox_item.setCheckState(Qt.CheckState.Checked if interval['marked_for_save'] else Qt.CheckState.Unchecked)
+            save_checkbox_item.setData(Qt.ItemDataRole.UserRole, interval['temp_id'])
+            self.intervals_table.setItem(row, 0, save_checkbox_item)
+
+            type_item = QTableWidgetItem(interval['type'].capitalize())
+            type_item.setFlags(type_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.intervals_table.setItem(row, 1, type_item)
+
+            original_duration_str = self._format_duration_for_display(interval['original_duration'])
+            original_duration_item = QTableWidgetItem(original_duration_str)
+            original_duration_item.setFlags(original_duration_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            original_duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.intervals_table.setItem(row, 2, original_duration_item)
+
+            final_duration_sec = interval['final_duration']
+            final_duration_str = self._format_duration_for_display(final_duration_sec)
+            final_duration_item = QTableWidgetItem(final_duration_str)
+            final_duration_item.setFlags(final_duration_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            final_duration_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            avg_for_this_type = self.avg_individual_work_duration if interval['type'] == 'work' else self.avg_individual_break_duration
+            color = self._get_deviation_color(final_duration_sec, avg_for_this_type)
+
+            # Apply color to all items in the row for visual consistency
+            for col_idx in range(1, 4): # Type, Original, Final
+                item_to_color = self.intervals_table.item(row, col_idx)
+                if item_to_color is None: # Create if not exists (should exist)
+                    item_to_color = QTableWidgetItem()
+                    self.intervals_table.setItem(row, col_idx, item_to_color)
+                item_to_color.setForeground(QBrush(color))
+            
+            self.intervals_table.setItem(row, 3, final_duration_item) # Ensure this specific item is set
+
+        self._update_button_states()
+        self._update_current_session_totals_and_styles()
+
+
+    def _get_selected_row_and_interval_index(self):
+        selected_rows = self.intervals_table.selectionModel().selectedRows()
+        if not selected_rows:
+            # QMessageBox.information(self, "Selection Needed", "Please select an interval from the list.")
+            return None, None # Return None instead of showing message box here
+
+        table_row_index = selected_rows[0].row()
+        temp_id_item = self.intervals_table.item(table_row_index, 0)
+        if not temp_id_item: return None, None
+
+        temp_id = temp_id_item.data(Qt.ItemDataRole.UserRole)
+        for internal_idx, interval_dict in enumerate(self.review_intervals):
+            if interval_dict['temp_id'] == temp_id:
+                return table_row_index, internal_idx
+        return None, None
+
+    def _edit_selected_duration_from_table(self, model_index: QModelIndex):
+        if model_index.isValid() and model_index.column() == 3 : # Allow edit on double click of "Final Duration" column
+            self._edit_duration_for_row(model_index.row())
+        elif model_index.isValid() : # if other column, just ensure selection
+            pass
+
+
+    def _edit_selected_duration_from_button(self):
+        table_row_idx, _ = self._get_selected_row_and_interval_index()
+        if table_row_idx is None:
+             QMessageBox.information(self, "Selection Needed", "Please select an interval from the list to edit its duration.")
+             return
+        self._edit_duration_for_row(table_row_idx)
+
+
+    def _edit_duration_for_row(self, table_row_idx):
+        temp_id_item = self.intervals_table.item(table_row_idx, 0)
+        if not temp_id_item: return
+        temp_id = temp_id_item.data(Qt.ItemDataRole.UserRole)
+
+        interval_internal_idx = -1
+        for i, interval_dict in enumerate(self.review_intervals):
+            if interval_dict['temp_id'] == temp_id:
+                interval_internal_idx = i
+                break
+        if interval_internal_idx == -1: return
+
+        current_interval_obj = self.review_intervals[interval_internal_idx]
+        current_final_duration_sec = current_interval_obj['final_duration']
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Edit Duration for {current_interval_obj['type'].capitalize()} Interval")
+        form_layout = QFormLayout(dialog)
+        hours_spin = QSpinBox(); hours_spin.setRange(0, 999); hours_spin.setSuffix(" h")
+        mins_spin = QSpinBox(); mins_spin.setRange(0, 59); mins_spin.setSuffix(" m")
+        secs_spin = QSpinBox(); secs_spin.setRange(0, 59); secs_spin.setSuffix(" s")
+        h, rem = divmod(int(current_final_duration_sec), 3600); m, s = divmod(rem, 60)
+        hours_spin.setValue(h); mins_spin.setValue(m); secs_spin.setValue(s)
+        duration_h_layout = QHBoxLayout(); duration_h_layout.addWidget(hours_spin)
+        duration_h_layout.addWidget(mins_spin); duration_h_layout.addWidget(secs_spin)
+        form_layout.addRow("New Duration:", duration_h_layout)
+        edit_button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        edit_button_box.accepted.connect(dialog.accept); edit_button_box.rejected.connect(dialog.reject)
+        form_layout.addRow(edit_button_box)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_total_seconds = hours_spin.value() * 3600 + mins_spin.value() * 60 + secs_spin.value()
+            if new_total_seconds < 0:
+                QMessageBox.warning(self, "Invalid Duration", "Duration cannot be negative.")
+                return
+
+            current_interval_obj['final_duration'] = new_total_seconds
+            self.intervals_table.item(table_row_idx, 3).setText(self._format_duration_for_display(new_total_seconds))
+
+            avg_for_type = self.avg_individual_work_duration if current_interval_obj['type'] == 'work' else self.avg_individual_break_duration
+            color = self._get_deviation_color(new_total_seconds, avg_for_type)
+            
+            for col_idx_to_color in range(1,4): # Type, Original, Final
+                item_to_color = self.intervals_table.item(table_row_idx, col_idx_to_color)
+                if item_to_color: item_to_color.setForeground(QBrush(color))
+
+            self._update_current_session_totals_and_styles()
+        self._update_button_states()
+
+    def _remove_selected_interval(self):
+        table_row_idx, interval_internal_idx = self._get_selected_row_and_interval_index()
+        if interval_internal_idx is None: # Check if selection was valid
+             QMessageBox.information(self, "Selection Needed", "Please select an interval from the list to remove.")
+             return
+
+        removed_interval_type = self.review_intervals[interval_internal_idx]['type']
+        reply = QMessageBox.question(self, "Confirm Removal",
+                                   f"Remove this '{removed_interval_type.capitalize()}' interval from the list?\n"
+                                   "It will not be saved.",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                   QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            del self.review_intervals[interval_internal_idx]
+            self._populate_table() # This re-populates and calls updates for totals and buttons
+            print(f"Interval removed. List size: {len(self.review_intervals)}")
+        # No explicit call to _update_button_states needed if _populate_table handles it.
+
+    def _mark_all_for_save(self):
+        changed = False
+        for row in range(self.intervals_table.rowCount()):
+            item = self.intervals_table.item(row, 0)
+            if item and item.checkState() != Qt.CheckState.Checked:
+                item.setCheckState(Qt.CheckState.Checked)
+                changed = True
+        if changed: print("Marked all intervals for saving.")
+
+
+    def _unmark_all_for_save(self):
+        changed = False
+        for row in range(self.intervals_table.rowCount()):
+            item = self.intervals_table.item(row, 0)
+            if item and item.checkState() != Qt.CheckState.Unchecked:
+                item.setCheckState(Qt.CheckState.Unchecked)
+                changed = True
+        if changed: print("Unmarked all intervals.")
+
+    def _save_marked_and_accept(self):
+        saved_entries_details = []
+        entries_to_save_from_dialog = []
+
+        # Sync checkbox states to self.review_intervals['marked_for_save']
+        for row_idx in range(self.intervals_table.rowCount()):
+            checkbox_item = self.intervals_table.item(row_idx, 0)
+            temp_id = checkbox_item.data(Qt.ItemDataRole.UserRole)
+            interval_obj = next((iv for iv in self.review_intervals if iv['temp_id'] == temp_id), None)
+            if interval_obj:
+                interval_obj['marked_for_save'] = checkbox_item.checkState() == Qt.CheckState.Checked
+        
+        for interval_data in self.review_intervals:
+            if interval_data['marked_for_save']:
+                if interval_data['final_duration'] > 0:
+                    entries_to_save_from_dialog.append({
+                        'type': interval_data['type'],
+                        'duration_seconds': interval_data['final_duration']
+                    })
+                else:
+                    print(f"Skipping save for interval (type {interval_data['type']}): final duration is zero.")
+        
+        if not entries_to_save_from_dialog:
+            reply = QMessageBox.information(self, "No Entries to Save",
+                                           "No entries were marked for saving or all marked entries had zero duration. Close without saving?",
+                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+            else:
+                self.session_reviewed_and_saved.emit(self.activity_id, self.activity_name, self.session_id, [])
+                super().accept()
+                return
+
+        num_saved_successfully = 0
+        for entry_data in entries_to_save_from_dialog:
+            success = self.db_manager.add_time_entry(
+                activity_id=self.activity_id,
+                duration_seconds=entry_data['duration_seconds'],
+                entry_type=entry_data['type'],
+                session_id=self.session_id
+            )
+            if success:
+                saved_entries_details.append(entry_data)
+                num_saved_successfully +=1
+            else:
+                QMessageBox.warning(self, "Database Error",
+                                    f"Failed to save a '{entry_data['type']}' interval of "
+                                    f"{entry_data['duration_seconds']}s to the database.")
+        
+        print(f"PostSessionReviewDialog: Saved {num_saved_successfully} of {len(entries_to_save_from_dialog)} marked entries.")
+        self.session_reviewed_and_saved.emit(self.activity_id, self.activity_name, self.session_id, saved_entries_details)
+        super().accept()
+
+    def _update_button_states(self):
+        has_selection = self.intervals_table.selectionModel().hasSelection()
+        has_items = len(self.review_intervals) > 0
+        
+        self.edit_duration_button.setEnabled(has_selection and has_items)
+        self.remove_button.setEnabled(has_selection and has_items)
+        self.mark_all_button.setEnabled(has_items)
+        self.unmark_all_button.setEnabled(has_items)
+
+    # accept() is implicitly handled by QDialogButtonBox connecting to _save_marked_and_accept
+    # def accept(self):
+    #     # Let _save_marked_and_accept handle logic
+    #     pass 
+        
+    def reject(self):
+        if self.review_intervals:
+            reply = QMessageBox.question(self, "Discard Session Review?",
+                                       "Are you sure you want to close without saving any intervals from this session?",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                       QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+        self.session_reviewed_and_saved.emit(self.activity_id, self.activity_name, self.session_id, [])
+        super().reject()
+        
 class HabitCellDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2673,7 +3113,6 @@ class HabitTableModel(QAbstractTableModel):
              print(f"Model: Move from {source_row} to {destination_row} failed & rolled back.")
              return False
 # --- End of HabitTableModel ---
-
 
 class HabitTrackerDialog(QDialog):
     # Optional: Define a signal if this dialog needs to inform others of changes
@@ -3224,11 +3663,18 @@ class MainWindow(QMainWindow):
         self._multitask_color_index += 1
         return color
 
-    def handle_item_entered(self, item, column):
-        """Вызывается, когда курсор входит в область элемента дерева."""
-        # Обновляем статус, только если таймеры не активны
-        if not self.active_timer_windows:
-            self.update_status_for_hovered_item(item)
+    def handle_item_entered(self, item: QTreeWidgetItem, column: int):
+        """Called when the mouse cursor enters an item's area in the tree."""
+        if item:
+            activity_id = item.data(0, Qt.ItemDataRole.UserRole)
+            activity_name_display = item.text(0) # Может содержать "[H] "
+            # Убираем префикс "[H] " для более чистого отображения имени в статусе
+            actual_name = activity_name_display.replace("[H] ", "", 1) if activity_name_display.startswith("[H] ") else activity_name_display
+            
+            if activity_id != getattr(self, '_current_hovered_activity_id_for_status', None): # Проверка для избежания лишних обновлений
+                self._current_hovered_activity_id_for_status = activity_id
+                self._update_main_status_label(activity_id=activity_id, activity_name=actual_name)
+        # Если item is None, обработка ухода мыши происходит в eventFilter
 
     def update_status_for_hovered_item(self, item):
         """Обновляет status_label для элемента под курсором или сбрасывает его."""
@@ -3253,21 +3699,26 @@ class MainWindow(QMainWindow):
             self.status_label.setText(status_string)
         else:
             self.update_ui_for_selection()
-    
-    def eventFilter(self, source, event):
-        """Фильтр событий для отслеживания ухода мыши из области дерева."""
-        # Проверяем, что событие от нужного виджета и тип события - уход мыши
-        if source is self.activity_tree.viewport() and event.type() == QEvent.Type.Leave:
-            # Мышь покинула область дерева, сбрасываем статус
-            # Проверяем, активны ли таймеры перед сбросом
-            if not self.active_timer_windows:
-                print("DEBUG: Mouse left tree viewport, resetting status.") # Отладка
-                self._hovered_item_id = None # Сбрасываем отслеживаемый ID
-                self.update_status_for_hovered_item(None) # Вызовет update_ui_for_selection
-            return True # Событие обработано
 
-        # Передаем все остальные события дальше
-        return super(MainWindow, self).eventFilter(source, event)
+    def eventFilter(self, source, event: QEvent):
+        if source is self.activity_tree.viewport() and event.type() == QEvent.Type.Leave:
+            self._current_hovered_activity_id_for_status = None # Сбрасываем ID при уходе мыши
+            selected_items = self.activity_tree.selectedItems()
+            if len(selected_items) == 1:
+                # Если что-то выбрано (один элемент), показать его статус
+                item = selected_items[0]
+                activity_id = item.data(0, Qt.ItemDataRole.UserRole)
+                activity_name_display = item.text(0)
+                actual_name = activity_name_display.replace("[H] ", "", 1) if activity_name_display.startswith("[H] ") else activity_name_display
+                self._update_main_status_label(activity_id=activity_id, activity_name=actual_name)
+            elif len(selected_items) > 1:
+                # Если выбрано несколько, показать количество
+                self._update_main_status_label(force_text=f"{len(selected_items)} activities selected.")
+            else:
+                # Если ничего не выбрано, показать текст по умолчанию
+                self._update_main_status_label() 
+            return True 
+        return super().eventFilter(source, event)
 
     def handle_selection_change(self):
         """Updates the internal list of selected activities and the UI."""
@@ -3283,94 +3734,71 @@ class MainWindow(QMainWindow):
         self.update_ui_for_selection()
 
     @staticmethod
-    def format_time(total_seconds):  # Only takes total_seconds
+    def format_time(total_seconds): # Only takes total_seconds
         """Formats seconds into HH:MM:SS."""
         total_seconds = abs(int(total_seconds))
         h, rem = divmod(total_seconds, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02}"
-
+    
     def update_ui_for_selection(self):
-        """Updates buttons and status bar based on current selection and timer state."""
-        # <<< ДОБАВИТЬ ПРОВЕРКУ >>>
-        # Если таймеры активны, статус бар обновляется в update_timer, не меняем его здесь
-        if self.active_timer_windows:
-            # Только обновляем состояние кнопок
-            num_selected = len(self.selected_activity_details)
-            # ... (только логика enable/disable кнопок, БЕЗ self.status_label.setText) ...
-            work_timers_active = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
-            countdown_timers_active = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
-            self.start_tasks_button.setEnabled(num_selected >= 1 and not countdown_timers_active)
-            has_selection_with_avg = any(self.db_manager.calculate_average_duration(aid) > 0 for aid, _ in self.selected_activity_details)
-            can_start_countdown = num_selected >= 1 and has_selection_with_avg and not work_timers_active
-            self.start_countdowns_button.setEnabled(can_start_countdown)
-            if self.manage_entries_button: self.manage_entries_button.setEnabled(num_selected == 1)
-
-            return # Выходим, не меняя status_label
-
-        # --- Если таймеры НЕ активны, обновляем и статус бар ---
+        """Updates buttons and status bar based on current selection."""
         num_selected = len(self.selected_activity_details)
         is_single_selection = num_selected == 1
         is_any_selection = num_selected >= 1
 
-        avg_duration_specific = 0 # Используется для статуса и кнопки countdown
-        status_text = "Select activity(-ies)"
-
+        # --- Обновление состояния кнопок ---
+        # (Эта логика остается такой же, как и раньше, управляя self.start_tasks_button, 
+        # self.start_countdowns_button, self.manage_entries_button и т.д.)
+        work_timers_active = any(not task.get('is_countdown', False) for task in self.active_timer_windows.values())
+        countdown_timers_active = any(task.get('is_countdown', False) for task in self.active_timer_windows.values())
+        
+        self.start_tasks_button.setEnabled(is_any_selection and not countdown_timers_active)
+        
+        avg_duration_for_countdown_check = 0
         if is_single_selection:
-            single_id, single_name = self.selected_activity_details[0]
-            try:
-                avg_duration_specific = self.db_manager.calculate_average_duration(single_id)
-                total_duration_branch = self.db_manager.calculate_total_duration_for_activity_branch(single_id)
-                # CORRECTED CALLS (ensure these are like this):
-                avg_text = f"Avg Entry: {self.format_time(avg_duration_specific)}" if avg_duration_specific > 0 else "Avg Entry: N/A"
-                total_text = f"Branch Total: {self.format_time(total_duration_branch)}"
-                status_text = f"Selected: {single_name} ({avg_text} | {total_text})"
-            except TypeError as e: # Catching the specific error to provide more context
-                print(f"Error calculating stats for {single_name} in update_ui_for_selection: {e}")
-                # This print helps confirm if the error originates here due to format_time
-                status_text = f"Selected: {single_name} (Error getting stats - TypeError)"
-            except Exception as e:
-                print(f"Error calculating stats for {single_name}: {e}")
-                status_text = f"Selected: {single_name} (Error getting stats)"
-        elif is_any_selection:
-            status_text = f"Selected: {num_selected} activities"
-
-        # <<< УСТАНОВКА СТАТУСА ПО ВЫБОРУ (когда нет hover и нет таймеров) >>>
-        self.status_label.setText(status_text)
-
-        # --- Обновление состояния кнопок (когда нет таймеров) ---
-        self.start_tasks_button.setEnabled(is_any_selection)
-        # Кнопка Countdown зависит от средней *продолжительности записи*, а не сессии
-        can_start_countdown = is_single_selection and avg_duration_specific > 0
+            # Для кнопки countdown нужна средняя *длительность записи*, а не сессии
+            avg_duration_for_countdown_check = self.db_manager.calculate_average_duration(self.selected_activity_details[0][0])
+        
+        can_start_countdown = is_single_selection and avg_duration_for_countdown_check > 0 and not work_timers_active
         self.start_countdowns_button.setEnabled(can_start_countdown)
 
         if self.manage_entries_button: self.manage_entries_button.setEnabled(is_single_selection)
-        if self.snapshot_button: self.snapshot_button.setEnabled(True)
-        if self.habit_tracker_button: self.habit_tracker_button.setEnabled(True)
-        self.activity_tree.setEnabled(True)
-                
+        # ... (другие кнопки, если есть)
+
+
+        # --- Обновление status_label через новый метод ---
+        if is_single_selection:
+            activity_id, activity_name = self.selected_activity_details[0]
+            # activity_name здесь уже без префикса "[H] " благодаря логике в handle_selection_change
+            self._update_main_status_label(activity_id=activity_id, activity_name=activity_name)
+        elif is_any_selection: # num_selected > 1
+            self._update_main_status_label(force_text=f"{num_selected} activities selected.")
+        else: # num_selected == 0
+            self._update_main_status_label() # Показать текст по умолчанию
+
     # <<< MODIFICATION: Renamed from toggle_timer >>>
+
     def start_selected_tasks(self):
         """Starts work timers for selected activities that are not already running."""
-        # <<< MODIFICATION: Added check for active countdowns >>>
         if any(task.get('is_countdown', False) for task in self.active_timer_windows.values()):
             QMessageBox.warning(self, "Timer Busy", "Cannot start work tasks while countdown timers are active.")
             return
-        # ... (rest of start_selected_tasks method remains the same as previous step) ...
+
         if len(self.selected_activity_details) == 0:
             QMessageBox.warning(self, "Error", "Please select at least one activity first.")
             return
 
         qtimer_was_running = self.qtimer.isActive()
         num_added = 0
-        default_font = self.activity_tree.font()
+        default_font = self.activity_tree.font() # Get default font once
         bold_font = QFont(default_font)
         bold_font.setBold(True)
 
         for activity_id, activity_name in self.selected_activity_details:
             if activity_id not in self.active_timer_windows:
                 print(f"Starting timer for: {activity_name} ({activity_id})")
-                task_start_time = time.time() # Use start time as unique session ID for this task
+                task_start_time = time.time()
                 color = self._get_next_multitask_color()
                 new_timer = TimerWindow(initial_color=color, parent=self)
 
@@ -3383,11 +3811,12 @@ class MainWindow(QMainWindow):
                     'window': new_timer,
                     'state': TimerWindow.STATE_TRACKING,
                     'current_interval_start_time': task_start_time,
-                    'total_session_work_sec': 0,
-                    'total_session_break_sec': 0,
-                    'session_id': task_start_time, # Store unique start time as session ID
+                    'total_session_work_sec': 0,      # For live display in TimerWindow
+                    'total_session_break_sec': 0,     # For live display in TimerWindow
+                    'session_id': task_start_time,
                     'activity_name': activity_name,
-                    'is_countdown': False # Explicitly mark as not countdown
+                    'is_countdown': False,
+                    'recorded_intervals': []  # <<< CORRECTLY INITIALIZED HERE
                 }
                 new_timer.showTrackingState("00:00:00", "00:00:00", activity_name)
 
@@ -3395,21 +3824,21 @@ class MainWindow(QMainWindow):
                 if item_ref:
                     item_ref.setFont(0, bold_font)
 
-                window_index = len(self.active_timer_windows) # Index for positioning (0-based)
+                # Calculate window_index based on only non-countdown timers currently active just before adding this one
+                window_index = sum(1 for task in self.active_timer_windows.values() if not task.get('is_countdown', False) and task['window'] is not new_timer)
                 self.show_and_position_timer_window(new_timer, window_index)
                 num_added += 1
             else:
-                 print(f"Task '{activity_name}' ({activity_id}) is already running.")
-
+                print(f"Task '{activity_name}' ({activity_id}) is already running.")
 
         if num_added > 0:
-             print(f"Started {num_added} new task(s).")
-             if not qtimer_was_running:
-                 self.qtimer.start(1000)
-                 print("Global timer started for UI updates.")
-             self.update_ui_for_selection() # Update button states
+            print(f"Started {num_added} new task(s).")
+            if not qtimer_was_running:
+                self.qtimer.start(1000) # Start global qtimer if it wasn't running
+                print("Global timer started for UI updates.")
+            self.update_ui_for_selection() # Update button states etc.
         else:
-             print("No new tasks were started (selected tasks already running or none selected).")
+            print("No new tasks were started (selected tasks already running or no valid selection).")
 
     def start_selected_countdowns(self):
         """Starts countdown timers for selected activities if possible."""
@@ -3423,7 +3852,7 @@ class MainWindow(QMainWindow):
 
         qtimer_was_running = self.qtimer.isActive()
         num_added = 0
-        default_font = self.activity_tree.font()
+        default_font = self.activity_tree.font() # Get default font once
         bold_font = QFont(default_font)
         bold_font.setBold(True)
 
@@ -3447,26 +3876,32 @@ class MainWindow(QMainWindow):
                     # Add task data, marking as countdown and storing target
                     self.active_timer_windows[activity_id] = {
                         'window': new_timer,
-                        'state': TimerWindow.STATE_TRACKING,
+                        'state': TimerWindow.STATE_TRACKING, # Countdown runs in tracking state
                         'current_interval_start_time': task_start_time,
-                        'total_session_work_sec': 0,
-                        'total_session_break_sec': 0,
-                        'session_id': task_start_time,
+                        'total_session_work_sec': 0, # For live display (accumulated work time)
+                        'total_session_break_sec': 0, # For live display (accumulated break time)
+                        'session_id': task_start_time, # Use unique start time as session ID
                         'activity_name': activity_name,
-                        'is_countdown': True, # Mark as countdown
+                        'is_countdown': True,         # Mark as countdown
                         'target_duration': target_duration, # Store target duration
+                        'recorded_intervals': []  # <<< CORRECTLY INITIALIZED HERE
                     }
                     # Initial display shows target time
                     new_timer.showTrackingState(self.format_time(target_duration), "00:00:00", activity_name)
-                    new_timer.set_overrun(False)
+                    new_timer.set_overrun(False) # Ensure overrun is initially false
                     item_ref = self._find_tree_item_by_id(activity_id)
                     if item_ref:
                         item_ref.setFont(0, bold_font)
 
-                    window_index = len(self.active_timer_windows) # Index for positioning
+                    # Calculate window_index based on only countdown timers currently active just before adding this one
+                    window_index = sum(1 for task in self.active_timer_windows.values() if task.get('is_countdown', False) and task['window'] is not new_timer)
                     self.show_and_position_timer_window(new_timer, window_index)
                     num_added += 1
                 else:
+                    QMessageBox.information(self, "Cannot Start Countdown",
+                                           f"Skipping countdown for '{activity_name}': "
+                                           "No average time data available to set a target duration. "
+                                           "Please ensure the activity has previous time entries.")
                     print(f"Skipping countdown for '{activity_name}' ({activity_id}): No average time data.")
             else:
                 print(f"Countdown or task for '{activity_name}' ({activity_id}) is already running.")
@@ -3474,11 +3909,11 @@ class MainWindow(QMainWindow):
         if num_added > 0:
             print(f"Started {num_added} new countdown timer(s).")
             if not qtimer_was_running:
-                self.qtimer.start(1000)
+                self.qtimer.start(1000) # Start global qtimer if it wasn't running
                 print("Global timer started for UI updates.")
             self.update_ui_for_selection() # Update button states
         else:
-            print("No new countdowns were started.")
+            print("No new countdowns were started (either already running, no selection, or no avg data).")
 
     def start_countdown_timer(self, activity_id, activity_name, average_duration):
         """Internal logic to start the countdown state and timer window."""
@@ -3528,87 +3963,88 @@ class MainWindow(QMainWindow):
         self.show_and_position_timer_window(countdown_window, 0) # Show countdown window first
         self.update_ui_for_selection() # Update buttons (disables start tasks, changes countdown button)
 
-
     # --- Pause/Resume/End Handlers ---
 
-# In class MainWindow:
-
     def handle_pause_request(self, activity_id):
-        """Handles the 'Pause' button click from a TimerWindow."""
+        """Handles the 'Pause' button click from a TimerWindow. Accumulates work interval."""
         print(f"DEBUG: Pause requested for {activity_id}")
         if activity_id in self.active_timer_windows:
             task_data = self.active_timer_windows[activity_id]
             if task_data['state'] == TimerWindow.STATE_TRACKING:
                 now = time.time()
                 work_duration = now - task_data['current_interval_start_time']
-                print(f"DEBUG: Calculated work_duration before save: {work_duration:.4f}s for {activity_id}")
-                task_data['total_session_work_sec'] += work_duration
-
-                if work_duration >= 1: # Only save if duration is 1s or more
-                    print(f"DEBUG: work_duration >= 1, attempting to call add_time_entry...")
-                    success = self.db_manager.add_time_entry(
-                        activity_id,
-                        int(work_duration),
-                        entry_type='work',
-                        session_id=task_data['session_id']
-                    )
-                    print(f"DEBUG: add_time_entry for 'work' returned: {success}")
-                else:
-                    print(f"DEBUG: work_duration < 1 ({work_duration:.4f}s), skipped add_time_entry for 'work'.")
-
-                task_data['state'] = TimerWindow.STATE_PAUSED
-                task_data['current_interval_start_time'] = now # Start of break interval
                 
-                # CORRECTED CALLS to self.format_time:
+                if work_duration >= 1:
+                    task_data['recorded_intervals'].append({
+                        'type': 'work',
+                        'duration_seconds': int(work_duration)
+                    })
+                    print(f"DEBUG: Appended 'work' interval ({int(work_duration)}s) to recorded_intervals for {activity_id}.")
+                else:
+                    print(f"DEBUG: work_duration < 1 ({work_duration:.4f}s), not adding to recorded_intervals for {activity_id}.")
+
+                task_data['total_session_work_sec'] += work_duration 
+                task_data['state'] = TimerWindow.STATE_PAUSED
+                task_data['current_interval_start_time'] = now 
+                
                 task_data['window'].showPausedState(
-                    self.format_time(0), # Current break interval starts at 0
-                    self.format_time(task_data['total_session_break_sec']),
+                    self.format_time(0),  # <<< CORRECTED CALL
+                    self.format_time(task_data['total_session_break_sec']), # <<< CORRECTED CALL
                     task_data['activity_name']
                 )
-                self.update_ui_for_selection() # Update button states etc.
+                self.update_ui_for_selection() 
             else:
                 print(f"-- Task {activity_id} ('{task_data.get('activity_name', 'N/A')}') already paused or in unexpected state.")
         else:
             print(f"-- Task {activity_id} not found for pause request.")
-            
+
     def handle_resume_request(self, activity_id):
-        """Handles the 'Resume' button click from a TimerWindow."""
+        """Handles the 'Resume' button click from a TimerWindow. Accumulates break interval."""
         print(f"DEBUG: Resume requested for {activity_id}")
         if activity_id in self.active_timer_windows:
             task_data = self.active_timer_windows[activity_id]
             if task_data['state'] == TimerWindow.STATE_PAUSED:
                 now = time.time()
                 break_duration = now - task_data['current_interval_start_time']
-                print(f"DEBUG: Calculated break_duration before save: {break_duration:.4f}s for {activity_id}")
-                task_data['total_session_break_sec'] += break_duration
 
                 if break_duration >= 1:
-                    print(f"DEBUG: break_duration >= 1, attempting to call add_time_entry...")
-                    success = self.db_manager.add_time_entry(activity_id, int(break_duration),
-                                                             entry_type='break', session_id=task_data['session_id'])
-                    print(f"DEBUG: add_time_entry for 'break' returned: {success}")
+                    task_data['recorded_intervals'].append({
+                        'type': 'break',
+                        'duration_seconds': int(break_duration)
+                    })
+                    print(f"DEBUG: Appended 'break' interval ({int(break_duration)}s) to recorded_intervals for {activity_id}.")
                 else:
-                    print(f"DEBUG: break_duration < 1, skipped add_time_entry.")
+                    print(f"DEBUG: break_duration < 1 ({break_duration:.4f}s), not adding to recorded_intervals for {activity_id}.")
 
+                task_data['total_session_break_sec'] += break_duration 
                 task_data['state'] = TimerWindow.STATE_TRACKING
-                task_data['current_interval_start_time'] = now 
+                task_data['current_interval_start_time'] = now  
 
                 if task_data.get('is_countdown', False):
                     target_duration = task_data.get('target_duration', 0)
-                    total_elapsed_session = task_data['total_session_work_sec']
-                    remaining = target_duration - total_elapsed_session
-                    # CORRECTED CALL:
-                    display_text_main = self.format_time(max(0, remaining))
+                    # 'total_session_work_sec' is the sum of *completed* work intervals so far for this session
+                    remaining = target_duration - task_data['total_session_work_sec'] # <<< CORRECTED: Was 'target'
+                    
+                    display_text_main = ""
                     is_over = remaining < 0
-                    overrun_secs = abs(remaining) if is_over else 0
+                    overrun_secs = 0
+
+                    if is_over:
+                        overrun_secs = abs(remaining)
+                        display_text_main = f"-{self.format_time(overrun_secs)}"
+                    else:
+                        display_text_main = self.format_time(remaining)
+                    
                     task_data['window'].set_overrun(is_over, overrun_secs)
-                    # CORRECTED CALL:
-                    task_data['window'].showTrackingState(display_text_main, self.format_time(total_elapsed_session), task_data['activity_name'])
-                else: 
-                    task_data['window'].set_overrun(False)
-                    # CORRECTED CALLS:
                     task_data['window'].showTrackingState(
-                        self.format_time(0), 
+                        display_text_main, 
+                        self.format_time(task_data['total_session_work_sec']), # Show total accumulated work
+                        task_data['activity_name']
+                    )
+                else: # Normal work timer
+                    task_data['window'].set_overrun(False)
+                    task_data['window'].showTrackingState(
+                        self.format_time(0), # Current work interval restarts from 0
                         self.format_time(task_data['total_session_work_sec']),
                         task_data['activity_name']
                     )
@@ -3617,207 +4053,214 @@ class MainWindow(QMainWindow):
                 print(f"-- Task {activity_id} ('{task_data.get('activity_name', 'N/A')}') not paused.")
         else:
             print(f"-- Task {activity_id} not found for resume request.")
-    
+
     def handle_end_request(self, activity_id):
         """Handles the 'End' button click from a TimerWindow."""
         print(f"End requested for {activity_id} via window button.")
-        # Usually, we want to save the last interval when ending via the window button
-        self.stop_single_task(activity_id, save_entry=True)
+        # Решение о сохранении теперь принимается в PostSessionReviewDialog
+        self.stop_single_task(activity_id) 
 
     def update_timer(self):
         if not self.qtimer.isActive():
-            print("DEBUG: update_timer called but qtimer is NOT active. This is unexpected.")
+            # print("DEBUG: update_timer called but qtimer is NOT active.") # Можно раскомментировать для отладки
             return
 
         if not self.active_timer_windows:
             print("DEBUG: MainWindow.update_timer: No active windows. Stopping qtimer.")
-            if self.qtimer.isActive(): 
+            if self.qtimer.isActive():  
                 self.qtimer.stop()
                 print("DEBUG: Global timer stopped by update_timer due to no active windows.")
-            self.update_ui_for_selection()
+            # self.update_ui_for_selection() # Это вызывается при остановке последнего таймера
             return
 
         current_time = time.time()
         active_ids_in_tick = list(self.active_timer_windows.keys())
 
-        for activity_id in active_ids_in_tick: 
+        for activity_id in active_ids_in_tick:  
             if activity_id not in self.active_timer_windows:
-                print(f"DEBUG: MainWindow.update_timer: activity_id {activity_id} disappeared during iteration. Skipping.")
+                print(f"DEBUG: MainWindow.update_timer: activity_id {activity_id} disappeared. Skipping.")
                 continue
 
             task_data = self.active_timer_windows[activity_id]
             window = task_data['window']
+            # activity_name = task_data['activity_name'] # Не используется в status_label здесь
 
             if task_data['state'] == TimerWindow.STATE_TRACKING:
                 current_interval_sec = current_time - task_data['current_interval_start_time']
                 total_session_sec = task_data['total_session_work_sec'] + current_interval_sec
+                
+                # timer_type_str = "Countdown" if task_data.get('is_countdown') else "Work" # Не используется в status_label
+                # display_text_main_ui = "" # Не используется в status_label
+                # total_session_str_ui = self.format_time(total_session_sec) # Не используется в status_label
 
                 if task_data.get('is_countdown', False):
                     target_duration = task_data.get('target_duration', 0)
                     remaining = target_duration - total_session_sec
+                    display_text_main_timer_window = ""
                     if remaining < 0:
                         overrun_seconds = abs(remaining)
                         window.set_overrun(True, overrun_seconds)
-                        # CORRECTED CALL:
-                        display_text_main = f"-{self.format_time(overrun_seconds)}"
+                        display_text_main_timer_window = f"-{self.format_time(overrun_seconds)}"
                     else:
                         window.set_overrun(False)
-                        # CORRECTED CALL:
-                        display_text_main = self.format_time(remaining)
-                    # CORRECTED CALL:
-                    window.showTrackingState(display_text_main, self.format_time(total_session_sec), task_data['activity_name'])
+                        display_text_main_timer_window = self.format_time(remaining)
+                    window.showTrackingState(display_text_main_timer_window, self.format_time(total_session_sec), task_data['activity_name'])
                 else: # Normal work timer
                     window.set_overrun(False)
-                    # CORRECTED CALLS:
-                    display_text_main = self.format_time(current_interval_sec)
-                    total_session_str = self.format_time(total_session_sec)
-                    window.showTrackingState(display_text_main, total_session_str, task_data['activity_name'])
+                    display_text_main_timer_window = self.format_time(current_interval_sec)
+                    window.showTrackingState(display_text_main_timer_window, self.format_time(total_session_sec), task_data['activity_name'])
 
             elif task_data['state'] == TimerWindow.STATE_PAUSED:
                 current_break_interval_sec = current_time - task_data['current_interval_start_time']
                 total_break_sec = task_data['total_session_break_sec'] + current_break_interval_sec
-                # CORRECTED CALLS:
-                current_break_str = self.format_time(current_break_interval_sec)
-                total_break_str = self.format_time(total_break_sec)
-                window.showPausedState(current_break_str, total_break_str, task_data['activity_name'])
+                current_break_str_timer_window = self.format_time(current_break_interval_sec)
+                total_break_str_timer_window = self.format_time(total_break_sec)
+                window.showPausedState(current_break_str_timer_window, total_break_str_timer_window, task_data['activity_name'])
+            
+            # --- СТРОКИ НИЖЕ УДАЛЕНЫ ИЛИ ЗАКОММЕНТИРОВАНЫ ---
+            # if len(self.active_timer_windows) == 1:
+            #    self.status_label.setText(f"{timer_type_str}: {activity_name} - {display_text_main_ui} (Total Session: {total_session_str_ui})")
+            # elif len(self.active_timer_windows) > 1:
+            #    self.status_label.setText(f"{len(self.active_timer_windows)} timers active. Hover/select an activity for its details.")
+        
+        # if not self.active_timer_windows: # Эта проверка уже есть в начале
+        #    self.qtimer.stop()
+        #    self.update_ui_for_selection()
 
-# In class MainWindow:
-
-    def stop_single_task(self, activity_id, save_entry=True):
-        """Stops one task, saves last interval if requested, updates global state if last task,
-           and prompts for habit logging if applicable based on total session work."""
-        print(f"DEBUG: Attempting to stop/end task ID: {activity_id}. Save last entry: {save_entry}")
+    def stop_single_task(self, activity_id):
+        """
+        Stops one task, accumulates its final interval,
+        then shows PostSessionReviewDialog.
+        Habit logging is handled based on the dialog's outcome via a connected slot.
+        """
+        print(f"DEBUG: MainWindow.stop_single_task called for activity ID: {activity_id}")
 
         if activity_id not in self.active_timer_windows:
             print(f"-- Task {activity_id} not found in active_timer_windows (already stopped or never started).")
             if not self.active_timer_windows and self.qtimer.isActive():
                 print(f"DEBUG: stop_single_task: qtimer is active but no active_timer_windows. Stopping qtimer. Task was {activity_id}.")
                 self.qtimer.stop()
-                print("DEBUG: Global timer stopped by stop_single_task (no active windows).")
-                self.update_ui_for_selection()
+                self._multitask_color_index = 0
+            self.update_ui_for_selection() # Update UI in any case
             return
 
-        task_data = self.active_timer_windows.pop(activity_id)
-        window = task_data['window']
+        task_data = self.active_timer_windows.get(activity_id)
+        if not task_data: # Should not happen if first check passes, but good for safety
+            print(f"-- Task {activity_id} disappeared unexpectedly before processing in stop_single_task.")
+            # Ensure UI consistency if this rare case happens
+            if activity_id in self.active_timer_windows: # Try to remove if somehow still there
+                 self.active_timer_windows.pop(activity_id, None)
+            if not self.active_timer_windows and self.qtimer.isActive():
+                self.qtimer.stop()
+                self._multitask_color_index = 0
+            self.update_ui_for_selection()
+            return
+
+        window_to_close = task_data['window'] # Store window reference before potential pop
         activity_name = task_data['activity_name']
         session_id = task_data['session_id']
-        
-        # This will be the duration of the very last segment (work or break)
-        duration_of_final_segment_for_db = 0
-        
-        # This will be updated to the session's true total work, including the final work segment if applicable
-        final_total_session_work_sec = task_data['total_session_work_sec']
+        # Make a copy of recorded_intervals to avoid modifying it while iterating elsewhere (though not strictly needed here)
+        current_recorded_intervals = list(task_data['recorded_intervals'])
 
-        if save_entry:
-            now = time.time()
-            last_interval_duration = now - task_data['current_interval_start_time']
-            duration_of_final_segment_for_db = int(last_interval_duration)
+        # Accumulate the final active interval
+        now = time.time()
+        last_interval_duration = now - task_data['current_interval_start_time']
 
-            entry_type_to_save = 'unknown'
-            if task_data['state'] == TimerWindow.STATE_TRACKING:
-                entry_type_to_save = 'work'
-                # Add this final work interval's duration to the session's recorded total work
-                final_total_session_work_sec += last_interval_duration 
-                
-                if duration_of_final_segment_for_db >= 1:
-                    print(f"DEBUG: duration_to_save_for_db ('{entry_type_to_save}') >= 1 ({duration_of_final_segment_for_db}s), attempting to call add_time_entry...")
-                    success = self.db_manager.add_time_entry(activity_id, duration_of_final_segment_for_db, entry_type=entry_type_to_save, session_id=session_id)
-                    print(f"DEBUG: add_time_entry for final '{entry_type_to_save}' returned: {success}")
-                else:
-                    print(f"DEBUG: duration_to_save_for_db ('{entry_type_to_save}') < 1 ({duration_of_final_segment_for_db:.4f}s), skipped add_time_entry.")
-
-            elif task_data['state'] == TimerWindow.STATE_PAUSED:
-                entry_type_to_save = 'break'
-                # final_total_session_work_sec already correctly reflects work done up to the pause.
-                if duration_of_final_segment_for_db >= 1:
-                    print(f"DEBUG: last_duration ('{entry_type_to_save}') >= 1 ({duration_of_final_segment_for_db}s), attempting to call add_time_entry...")
-                    success = self.db_manager.add_time_entry(activity_id, duration_of_final_segment_for_db, entry_type=entry_type_to_save, session_id=session_id)
-                    print(f"DEBUG: add_time_entry for final '{entry_type_to_save}' returned: {success}")
-                else:
-                    print(f"DEBUG: last_duration ('{entry_type_to_save}') < 1 ({duration_of_final_segment_for_db:.4f}s), skipped add_time_entry.")
+        if last_interval_duration >= 1:
+            entry_type_to_accumulate = 'work' if task_data['state'] == TimerWindow.STATE_TRACKING else 'break'
+            current_recorded_intervals.append({
+                'type': entry_type_to_accumulate,
+                'duration_seconds': int(last_interval_duration)
+            })
+            print(f"DEBUG: Accumulated final '{entry_type_to_accumulate}' interval ({int(last_interval_duration)}s) for {activity_id}.")
         else:
-            print(f"-- Ending task '{activity_name}' (ID: {activity_id}) without saving last interval because save_entry=False.")
+            print(f"DEBUG: Final interval < 1s for {activity_id} (duration: {last_interval_duration:.2f}s), not adding to recorded_intervals for review dialog.")
 
-        # --- Habit Prompt Logic ---
-        habit_config_tuple = self.db_manager.get_activity_habit_config(activity_id)
-        is_configured_as_habit = habit_config_tuple[0] is not None and habit_config_tuple[0] != HABIT_TYPE_NONE
-        
-        # Use the session's final total work duration for the prompt's context.
-        # This value (final_total_session_work_sec) now correctly includes the last work segment if the timer was running.
-        relevant_work_duration_for_habit_prompt = int(final_total_session_work_sec)
-
-        if save_entry and is_configured_as_habit and relevant_work_duration_for_habit_prompt >= 1:
-            print(f"-- Checking habit prompt for task {activity_id} ('{activity_name}') with total session work {relevant_work_duration_for_habit_prompt}s (Ended in state: {task_data['state']}).")
-            self.prompt_and_log_habit_after_timer(activity_id, activity_name, habit_config_tuple, relevant_work_duration_for_habit_prompt)
+        # --- Show PostSessionReviewDialog ---
+        if not current_recorded_intervals:
+            print(f"-- No significant intervals recorded for session '{activity_name}' (ID: {activity_id}). Skipping review dialog.")
+            # If no intervals, no review is needed, but we still need to clean up the task.
         else:
-            if not is_configured_as_habit:
-                print(f"-- No habit configured for task {activity_id} for post-timer prompt.")
-            elif not (relevant_work_duration_for_habit_prompt >= 1):
-                 print(f"-- No significant work done in session for habit prompt for task {activity_id} (Total work: {relevant_work_duration_for_habit_prompt:.2f}s).")
-            elif not save_entry:
-                print(f"-- Not prompting habit for task {activity_id} because save_entry is False.")
+            print(f"DEBUG: Showing PostSessionReviewDialog for '{activity_name}' (ID: {activity_id}) with {len(current_recorded_intervals)} intervals.")
+            review_dialog = PostSessionReviewDialog(
+                db_manager=self.db_manager,
+                activity_id=activity_id,
+                activity_name=activity_name,
+                session_id=session_id,
+                recorded_intervals_data=current_recorded_intervals,
+                main_window_instance=self,  # <<< Pass MainWindow instance
+                parent=self
+            )
+            # Connect the signal from the dialog to the handler slot in MainWindow
+            review_dialog.session_reviewed_and_saved.connect(self._handle_session_review_outcome)
+            review_dialog.exec()  # Modal execution: waits until dialog is closed
+            # Further actions (like habit prompt) are now primarily handled by _handle_session_review_outcome
 
-        if window:
-            window.close()
+        # --- Cleanup after task (occurs after dialog is closed or if dialog was skipped) ---
+        if window_to_close:
+            try:
+                window_to_close.close() # Close the associated TimerWindow
+            except RuntimeError as e:
+                 print(f"DEBUG: Error closing timer window for {activity_id} (may already be closed): {e}")
+
         item_ref = self._find_tree_item_by_id(activity_id)
         if item_ref:
-            item_ref.setFont(0, self.activity_tree.font())
+            item_ref.setFont(0, self.activity_tree.font()) # Reset font to default
 
+        # Remove the task from the active list *after* all its data has been processed
+        if activity_id in self.active_timer_windows:
+            self.active_timer_windows.pop(activity_id)
+            print(f"DEBUG: Task {activity_id} ('{activity_name}') removed from active_timer_windows.")
+        else:
+            # This case should ideally not be hit if the initial check worked,
+            # but good to log if it does.
+            print(f"DEBUG: Task {activity_id} ('{activity_name}') was already removed from active_timer_windows before final pop.")
+
+        # Update UI elements (buttons, status bar)
+        self.update_ui_for_selection()
+
+        # Check if the global QTimer needs to be stopped
         if not self.active_timer_windows:
-            print("-- All active timers stopped/managed by stop_single_task.")
+            print("-- All active timers now stopped/managed after stop_single_task.")
             if self.qtimer.isActive():
                 print(f"DEBUG: stop_single_task: Stopping qtimer. No more active_timer_windows. Last task was {activity_id}.")
                 self.qtimer.stop()
-                print("DEBUG: Global timer stopped by stop_single_task.")
-            self._multitask_color_index = 0
+            self._multitask_color_index = 0 # Reset color index when all timers are done
         else:
             print(f"DEBUG: stop_single_task: {len(self.active_timer_windows)} timers still active.")
-        self.update_ui_for_selection()
-    
+            
     def stop_all_tasks(self):
-        """Stops all active timers (work and countdown), saving last intervals by default."""
+        """Stops all active timers (work and countdown), showing review dialog for each."""
         if not self.active_timer_windows:
             print("stop_all_tasks called but no active tasks to stop.")
             if self.qtimer.isActive():
-                 print("DEBUG: stop_all_tasks: qtimer was active with no active_timer_windows. Stopping qtimer.")
-                 self.qtimer.stop()
-                 print("DEBUG: Global timer stopped by stop_all_tasks (no active windows).")
-            self.update_ui_for_selection() # Ensure UI is in a consistent state
+                self.qtimer.stop()
+            self.update_ui_for_selection()
             return
 
         num_active = len(self.active_timer_windows)
-        print(f"Stopping {num_active} active task(s) via stop_all_tasks.")
+        print(f"Stopping {num_active} active task(s) via stop_all_tasks. Review dialog will appear for each.")
         
-        ids_to_stop = list(self.active_timer_windows.keys()) # Iterate over a copy
+        ids_to_stop = list(self.active_timer_windows.keys()) 
         for activity_id in ids_to_stop:
-            # Ensure task still exists in case of rapid/overlapping calls, though pop in stop_single_task should handle it.
-            if activity_id in self.active_timer_windows:
-                 self.stop_single_task(activity_id, save_entry=True)
+            if activity_id in self.active_timer_windows: # Проверяем, что задача все еще активна
+                self.stop_single_task(activity_id) # Это вызовет диалог для каждой задачи
             else:
-                 print(f"DEBUG: stop_all_tasks: Task {activity_id} was already removed before its turn.")
-
-
-        # After loop, active_timer_windows should be empty.
+                print(f"DEBUG: stop_all_tasks: Task {activity_id} was already removed before its turn.")
+        
+        # После цикла active_timer_windows должен быть пуст, если все stop_single_task отработали
         if self.active_timer_windows:
-             print(f"WARNING: stop_all_tasks: active_timer_windows not empty after stopping all. Remaining: {list(self.active_timer_windows.keys())}")
-             # Force clear and close any remaining windows as a fallback
-             for aid_rem in list(self.active_timer_windows.keys()):
-                  task_data_rem = self.active_timer_windows.pop(aid_rem, None)
-                  if task_data_rem and task_data_rem.get('window'):
-                      try:
-                          task_data_rem['window'].close()
-                      except Exception as e:
-                          print(f"Error closing leftover window for {aid_rem} in stop_all_tasks: {e}")
+            print(f"WARNING: stop_all_tasks: active_timer_windows not empty. Remaining: {list(self.active_timer_windows.keys())}")
+            # Принудительная очистка как запасной вариант
+            for aid_rem in list(self.active_timer_windows.keys()):
+                task_data_rem = self.active_timer_windows.pop(aid_rem, None)
+                if task_data_rem and task_data_rem.get('window'):
+                    try: task_data_rem['window'].close()
+                    except Exception as e: print(f"Error closing leftover window for {aid_rem}: {e}")
         
         self._multitask_color_index = 0
-
-        # qtimer should have been stopped by the last call to stop_single_task
-        # if active_timer_windows became empty. Double check.
         if not self.active_timer_windows and self.qtimer.isActive():
-            print("DEBUG: stop_all_tasks: Forcing qtimer stop as a final check as active_timer_windows is empty.")
-            self.qtimer.stop()
-            print("DEBUG: Global timer stopped by stop_all_tasks (final check).")
-        
+             self.qtimer.stop()
         self.update_ui_for_selection()
 
     def format_time(instance_or_none, total_seconds):
@@ -3826,6 +4269,40 @@ class MainWindow(QMainWindow):
         h, rem = divmod(total_seconds, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02}:{m:02}:{s:02}"
+
+    def _handle_session_review_outcome(self, reviewed_activity_id: int, activity_name: str, session_id: float, saved_entries_details: list):
+        print(f"MainWindow: Session review outcome for '{activity_name}' (ID: {reviewed_activity_id}, Session: {session_id}). "
+              f"Saved {len(saved_entries_details)} entries.")
+
+        if saved_entries_details: # Если хоть что-то было сохранено
+            self.habits_updated.emit() # Обновить heatmap, трекер привычек, стрики
+
+            # --- Логика запроса на трекинг привычки ---
+            habit_config_tuple = self.db_manager.get_activity_habit_config(reviewed_activity_id)
+            is_configured_as_habit = habit_config_tuple[0] is not None and habit_config_tuple[0] != HABIT_TYPE_NONE
+
+            if is_configured_as_habit:
+                total_work_duration_actually_saved = sum(
+                    entry['duration_seconds'] for entry in saved_entries_details if entry['type'] == 'work'
+                )
+
+                if total_work_duration_actually_saved >= 1:
+                    print(f"--- MainWindow: Calling prompt_and_log_habit for '{activity_name}' "
+                          f"(ID: {reviewed_activity_id}) with saved work: {total_work_duration_actually_saved}s")
+                    self.prompt_and_log_habit_after_timer(
+                        reviewed_activity_id,
+                        activity_name, # Имя активности передается сигналом
+                        habit_config_tuple,
+                        total_work_duration_actually_saved
+                    )
+                else:
+                    print(f"--- MainWindow: Not calling habit prompt for '{activity_name}' "
+                          f"(ID: {reviewed_activity_id}). No significant work saved ({total_work_duration_actually_saved}s).")
+            else:
+                print(f"--- MainWindow: '{activity_name}' (ID: {reviewed_activity_id}) is not configured as a habit. Skipping habit prompt.")
+        
+        # Обновление UI и проверка глобального таймера происходит в stop_single_task *после* закрытия диалога.
+        # Здесь мы только обработали результат сохранения и логирования привычки.
 
     def show_and_position_timer_window(self, timer_window: TimerWindow, window_index: int):
         """Shows and positions a new timer window."""
@@ -3843,6 +4320,31 @@ class MainWindow(QMainWindow):
             if y > max_y : y = max_y # Adjust last window if needed
             timer_window.move(QPoint(x, y))
         except Exception as e: print(f"Error positioning timer window: {e}")
+
+    def _update_main_status_label(self, activity_id=None, activity_name=None, force_text=None):
+        """
+        Updates the main status label.
+        Shows specific activity stats if activity_id is provided.
+        Shows forced text if provided.
+        Otherwise, shows a default message.
+        """
+        if force_text is not None:
+            self.status_label.setText(force_text)
+        elif activity_id is not None and activity_name is not None:
+            # Показываем средние времена сессий для данной активности
+            avg_work, avg_break, avg_total = self.db_manager.calculate_average_session_times(activity_id)
+            
+            fmt_total = self.format_time(avg_total)
+            fmt_work = self.format_time(avg_work)
+            fmt_break = self.format_time(avg_break)
+            
+            # Используем сокращенные метки для экономии места
+            status_string = (f"Activity: {activity_name} | "
+                             f"Avg Session - W: {fmt_work}, B: {fmt_break}, T: {fmt_total}")
+            self.status_label.setText(status_string)
+        else:
+            # Текст по умолчанию, если ничего не выбрано/не подсвечено
+            self.status_label.setText("Select an activity or hover for details.")
 
     def closeEvent(self, event):
         """Handles the main window close event."""

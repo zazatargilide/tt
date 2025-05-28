@@ -1,112 +1,87 @@
-# Ritual Time Tracker (v0.0935)
+# Ritual - Time & Activity Tracker (v0.09362)⏱️
 
-A desktop application for tracking time spent on hierarchical activities and monitoring daily habit completion, built with Python and PyQt6.
-
----
-
-## Main Idea
-
-Ritual Time Tracker helps you organize your tasks or activities in a tree-like structure (parent activities with sub-activities) and track the time you spend on them. It provides two main modes for time tracking: a simple stopwatch (**Track**) and a **Countdown** timer based on the average time previously spent on an activity. **It now also includes features for tracking daily habit completion.**
+Ritual is a desktop application designed to help you meticulously track your time across various activities, manage your tasks efficiently, and build positive daily habits. Gain insights into your productivity and cultivate consistency with an intuitive interface and powerful tracking tools.
 
 ---
 
-## Key Features
+## ✨ Key Features
 
-* **Hierarchical Activity Management:**
-    * Add top-level activities.
-    * Add sub-activities under existing ones to create a tree structure.
-    * Rename activities.
-    * Delete activities (including all sub-activities and associated data).
-    * Activities are managed via a right-click context menu on the activity tree.
-    * **Configure activities as trackable habits** (see Habit Tracking below).
-* **Time Tracking Modes:**
-    * **Work/Tracking Timer:** A simple stopwatch to track elapsed time for the selected activity.
-    * **Countdown Timer:** Starts a timer based on the calculated average duration of previously logged time entries for the selected activity. Useful for timeboxing. The timer window turns red if you exceed the average time.
-    * Optional prompt to log associated habit completion after stopping a timer.
-* **Floating Timer Window:**
-    * A small, always-on-top window displays the current timer (either counting up or down), which can be moved around the screen.
-* **Time Entry Management:**
-    * View all time entries recorded for a specific activity.
-    * Manually add new time entries with specific dates, times, and durations.
-    * Edit the duration of existing entries.
-    * Delete specific time entries.
-* **Habit Tracking:**
-    * **Configuration:** Activities can be marked as habits with types:
-        * *Binary:* Done / Not Done.
-        * *Percentage:* 0-100% in 25% increments.
-        * *Numeric:* Track any number (e.g., pages read, km run) with optional units and a daily goal.
-    * **Tracker Dialog:** A dedicated dialog (`Habit Tracker` button) displays a monthly grid.
-    * **Logging:** Log daily habit progress via double-click interaction in the grid (toggle binary, cycle percentage, enter numeric value).
-    * **Visualization:** Includes an animated yearly heatmap on the main window showing habit completion density. Days where average numeric goal completion exceeds 70% are highlighted in the tracker dialog header.
-    * **Reordering:** Habits can be reordered in the tracker view using the row header context menu.
-* **Daily Snapshot:**
-    * View a summary of **time spent** across all activities for a selected date.
-    * Shows both a hierarchical time summary (total time per activity branch) and a detailed list of individual time entries for the day. *(Note: Does not currently show habit data)*.
-* **Technical:**
-    * Uses a local SQLite database (`time_tracker.db`) to store activities, time entries, and habit logs.
-    * **Timezone Handling:** Stores all timestamps in UTC and converts to the user's local time for display, preventing timezone offset errors.
-* **Dark Theme:**
-    * Features a dark user interface for comfortable viewing.
+* **Hierarchical Activity Management**: Organize your tasks and projects in a nested tree structure. Add, rename, delete, and rearrange activities with ease.
+* **Versatile Time Tracking**:
+    * **Standard Timers**: Start timers for one or multiple selected tasks.
+    * **Countdown Timers**: Work in focused bursts using countdowns based on your average time for an activity.
+    * **Multi-Tasking**: Run multiple timers (standard or countdown, but not mixed types simultaneously) each in its own floating window.
+* **Post-Session Review**: After stopping a timer, review all recorded work/break intervals. Edit durations or discard intervals before saving them permanently, ensuring data accuracy.
+    * **Smart Highlighting**: Intervals and session totals that deviate significantly (>10%) from historical averages are visually highlighted.
+* **Comprehensive Habit Tracking**:
+    * Configure any activity as a daily habit (Binary, Percentage, or Numeric with custom units & goals).
+    * Log habit completion in an intuitive monthly grid.
+    * Visualize yearly progress with an animated **Habit Heatmap**.
+    * Track **Global Daily Streaks** based on overall habit completion.
+* **In-Depth Statistics & Reports**:
+    * **Status Bar**: Quick stats for hovered or selected activities (average entry/session times, branch totals).
+    * **Daily Snapshot**: Detailed breakdown of time spent per activity (including sub-activities) for any selected day, plus a list of all entries.
+    * **Manual Entry Management**: Add, edit, or delete historical time entries.
+* **Customizable Interface**: Includes a dark theme for comfortable viewing.
 
 ---
 
-## Usage Guide
+## 🚀 Getting Started
 
-1.  **Running the Application:**
-    * Ensure you have the necessary dependencies installed (see below).
-    * Run the Python script: `python time_tracker_app.py`
-
-2.  **Managing Activities:**
-    * **Add:** Right-click in the empty space of the "Activities" tree view to add a top-level activity. Right-click on an existing activity to add a sub-activity under it.
-    * **Rename/Delete:** Right-click on the activity you want to modify and select "Rename" or "Delete".
-    * **Configure Habit:** Right-click an activity and select "Configure as Habit...". Check the box, choose the type (Binary, Percentage, Numeric), and fill in optional Unit and Goal for Numeric types.
-
-3.  **Tracking Time:**
-    * **Select:** Click on an activity in the tree.
-    * **Start Work Timer:** Click the `Start Tracking` button.
-    * **Start Countdown Timer:** If the activity has previous time entries, click `Start Countdown`.
-    * **Stop Timer:** Click the button again (`Stop Tracking` or `Stop Countdown`).
-    * **Log Habit (Optional):** If the finished activity is a configured habit, you may be prompted to log its completion for the day.
-
-4.  **Tracking Habits:**
-    * **Open Tracker:** Click the `Habit Tracker` button.
-    * **Navigate:** Use "< Prev", "Next >", or "Today" to change the displayed month.
-    * **Log:** Double-click a cell in the grid corresponding to a habit and date. This will toggle binary habits, cycle through percentage options, or open an input dialog for numeric habits. Entering '0' for a numeric habit prompts confirmation to either log zero or clear the entry (set to None).
-    * **View Heatmap:** Observe the yearly heatmap on the main window for a quick overview of daily habit completion intensity.
-    * **Reorder Habits:** In the Habit Tracker dialog, right-click on a habit name in the *row header* (left side) and select "Move Up" or "Move Down".
-
-5.  **Managing Time Entries:**
-    * Select an activity.
-    * Click the `Manage Entries` button.
-    * Use the dialog buttons to add, edit, or delete **time entries** (not habit logs) for that specific activity.
-
-6.  **Viewing Daily Time Snapshot:**
-    * Click the `Daily Snapshot` button.
-    * Select a date.
-    * Click `Show` to view the **time** summary and detailed **time entries** for that day.
-
----
-
-## Dependencies
+### Prerequisites
 
 * Python 3.x
-* PyQt6 (`pip install PyQt6`)
-* SQLite (usually built into Python)
+* PyQt6 library (`pip install PyQt6`)
+
+### Running the Application
+
+1.  Save the application code as a Python file (e.g., `ritual_tracker.py`).
+2.  Open a terminal or command prompt.
+3.  Navigate to the directory where you saved the file.
+4.  Run the script using:
+    ```bash
+    python ritual_tracker.py
+    ```
+    The application window will appear, and a `time_tracker.db` SQLite database file will be created in the same directory to store your data.
 
 ---
 
-## How to Run
+## 📖 Core Usage Overview
 
-1.  Make sure Python 3 and pip are installed.
-2.  Install the required library:
-    ```bash
-    pip install PyQt6
-    ```
-3.  Navigate to the directory containing `time_tracker_app.py`.
-4.  Run the application from your terminal:
-    ```bash
-    python time_tracker_app.py
-    ```
-5.  The application window will appear, and the `time_tracker.db` file will be created or updated in the same directory.
+### 1. Managing Activities 📂
+
+* **Add**: Right-click in the activity tree area to add a top-level activity, or right-click an existing activity to add a sub-activity.
+* **Rename/Delete/Configure Habit**: Right-click an activity to access these options.
+* **Select**: Click to select. Use `Ctrl+Click` or `Shift+Click` to select multiple activities for starting timers.
+
+### 2. Tracking Time ⏳
+
+* **Start Timers**: Select one or more activities, then click "**Start Selected Task(s)**" or "**Start Selected Countdown(s)**".
+    * Each active timer appears in a small, movable window.
+    * Use the "**Pause**", "**Resume**", or "**End**" buttons in the timer window.
+* **Post-Session Review**: When you click "**End**":
+    * A dialog appears listing all work/break intervals from that session.
+    * **Checkbox**: Uncheck any interval you don't want to save.
+    * **Edit Duration**: Double-click an interval's "Final Duration" or select it and use the "Edit" button to adjust the time.
+    * **Remove**: Remove an interval entirely from the review.
+    * Click "**Save Marked & Close**" to log the selected intervals.
+
+### 3. Tracking Habits ✅
+
+* **Configure**: Right-click an activity -> "**Configure '[Activity Name]' as Habit...**". Choose type (Binary, Percentage, Numeric) and set goal/unit if applicable.
+* **Log**: Click "**Habit Tracker**". Double-click a cell for a habit/day to log its status or value.
+    * Binary: Toggles done/not done.
+    * Percentage: Enter % (0-100).
+    * Numeric: Enter a value to add to the daily total.
+* **View**: The **Habit Heatmap** on the main window visualizes yearly progress.
+
+### 4. Viewing Stats & Progress 📊
+
+* **Status Bar**: Automatically updates with info on hovered or selected activities.
+* **Daily Snapshot**: Click "**Daily Snapshot**", pick a date, and see a detailed time breakdown.
+* **Manage Entries**: Select an activity and click "**Manage Entries**" to view/edit its entire time log history.
+* **Global Streaks**: Check your current and maximum daily habit streaks on the main window.
 
 ---
+
+Enjoy using Ritual to master your time and build lasting habits!
